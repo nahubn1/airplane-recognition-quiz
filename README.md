@@ -6,8 +6,7 @@ A minimalist, aviation-themed quiz that tests aircraft recognition skills. Each 
 
 ## Live Demo
 
-* **Production**: `https://<your-vercel-domain>.vercel.app`
-  *(Replace this with the actual URL after deployment.)*
+* **Production**: https://airplane-recognition-quiz.vercel.app/
 
 ---
 
