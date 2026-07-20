@@ -1,3 +1,62 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+@keyframes aircraft-skeleton-pulse {
+  0%, 100% {
+    background-position: 200% 0;
+    opacity: 0.65;
+  }
+  50% {
+    background-position: -200% 0;
+    opacity: 1;
+  }
+}
+
+.aircraft-image-skeleton {
+  background: linear-gradient(
+    100deg,
+    rgb(30 41 59) 25%,
+    rgb(51 65 85) 45%,
+    rgb(71 85 105) 50%,
+    rgb(51 65 85) 55%,
+    rgb(30 41 59) 75%
+  );
+  background-size: 200% 100%;
+  animation: aircraft-skeleton-pulse 1.4s ease-in-out infinite;
+}
+
+.aircraft-image-foreground {
+  -webkit-mask-image: radial-gradient(
+    ellipse 78% 88% at center,
+    rgb(0 0 0) 48%,
+    rgb(0 0 0 / 0.8) 64%,
+    rgb(0 0 0 / 0.36) 80%,
+    transparent 100%
+  );
+  mask-image: radial-gradient(
+    ellipse 78% 88% at center,
+    rgb(0 0 0) 48%,
+    rgb(0 0 0 / 0.8) 64%,
+    rgb(0 0 0 / 0.36) 80%,
+    transparent 100%
+  );
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .aircraft-image-skeleton {
+    animation: none;
+  }
+}
+
+/* Windows display scaling often produces a wide but short CSS viewport at
+   100% browser zoom. Match the density of a taller desktop instead of letting
+   the xl layout become oversized. */
+@media (min-width: 1280px) and (max-height: 900px) {
+  .menu-screen {
+    width: 119.0476%;
+    max-width: none;
+    min-height: calc((100dvh - 4rem) / 0.84);
+    zoom: 0.84;
+  }
+}

@@ -30,7 +30,7 @@ A minimalist, aviation-themed quiz that tests aircraft recognition skills. Each 
 
 ### Engagement
 
-* **Local leaderboard** (browser `localStorage`).
+* **Global leaderboard** backed by Cloudflare D1, with a browser `localStorage` offline fallback.
 * **Streak counter** + bonus points.
 * **Progress bars** for time and round progress.
 
@@ -94,6 +94,22 @@ Open the dev URL (shown in your terminal), usually `http://localhost:5173`.
 5. Replace the **Live Demo** link above with your Vercel domain.
 
 > Any future push to `main` will auto-deploy.
+
+## Free Deployment with a Global Leaderboard (Cloudflare)
+
+This project includes Cloudflare Pages Functions and a D1 migration for the
+global leaderboard.
+
+Create the D1 database from **Workers & Pages > D1 SQL Database** in the
+Cloudflare dashboard. Open its SQL console and paste the contents of
+`migrations/0001_global_leaderboard.sql`, then execute it.
+
+Deploy by importing the GitHub repository into Cloudflare Pages with
+`npm run build` as the build command and `dist` as the output directory.
+In the Pages project settings, add a D1 binding named exactly `DB` and select
+the leaderboard database. The frontend automatically uses `/api/leaderboard`
+and `/api/scores` in production, while retaining the local leaderboard as an
+offline fallback.
 
 ---
 

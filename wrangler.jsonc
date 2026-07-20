@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "airplane-recognition-quiz",
+  "compatibility_date": "2026-07-20",
+  "pages_build_output_dir": "dist",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "airplane-quiz-leaderboard",
+      "database_id": "cf8c83c9-6bd9-4781-8667-a46f2283d26a",
+      "migrations_dir": "migrations"
+    }
+  ]
+}

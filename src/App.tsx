@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+﻿import React, { useEffect, useMemo, useRef, useState } from "react";
+import { AIRCRAFT_DB, TYPES, type Aircraft } from "./aircraftData";
 
 // ==========================
 // Airplane Recognition Quiz
@@ -8,7 +9,7 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 // - Exactly 4 multiple-choice options (per user request)
 // - Immediate feedback with a short fact (wrong answers show a card)
 // - Timer fixed to 15s, speed/accuracy scoring, streak + bonus
-// - Local leaderboard (localStorage)
+// - Global leaderboard with a localStorage offline fallback
 // - Replayability (randomization, no photo/model repeats per session)
 // - Minimalist aviation-themed UI, responsive full-bleed photo
 // - Smooth transitions between questions
@@ -31,6 +32,54 @@ const QUIZ_DEFAULTS = {
 const OPTIONS_PER_QUESTION = 4; // Fixed at 4 choices
 
 const IMAGE_SOURCE: "wikipedia" | "internal" = "wikipedia";
+const QUIZ_COMPLETED_KEY = "airquiz_completed_quiz_v1";
+const IMAGE_WARM_QUEUE_SIZE = 5;
+const PLAYER_PROFILE_KEY = "airquiz_player_v1";
+const LOCAL_LEADERBOARD_KEY = "airquiz_leaderboard_v1";
+
+type LeaderboardEntry = { name: string; score: number; date: string };
+type AnonymousProfile = { deviceId: string; username: string };
+
+const CALLSIGN_SUFFIXES = [
+  "Falcon", "Comet", "Raptor", "Voyager", "Harrier", "Condor",
+  "Meteor", "Skylark", "Phantom", "Nomad", "Osprey", "Viper",
+];
+
+function generateCallsign() {
+  const suffix = choice(CALLSIGN_SUFFIXES);
+  const number = String(100 + randInt(900));
+  return `${suffix}${number}`;
+}
+
+function getAnonymousProfile(): AnonymousProfile {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PLAYER_PROFILE_KEY) || "null");
+    if (saved?.deviceId && saved?.username) return saved;
+  } catch {
+    // Create a fresh anonymous profile below.
+  }
+  const profile = {
+    deviceId: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+    username: generateCallsign(),
+  };
+  try {
+    localStorage.setItem(PLAYER_PROFILE_KEY, JSON.stringify(profile));
+  } catch {
+    // The profile remains valid for this browser session.
+  }
+  return profile;
+}
+
+function saveAnonymousUsername(username: string) {
+  const profile = getAnonymousProfile();
+  const updated = { ...profile, username };
+  try {
+    localStorage.setItem(PLAYER_PROFILE_KEY, JSON.stringify(updated));
+  } catch {
+    // Continue with the in-memory submission when storage is unavailable.
+  }
+  return updated;
+}
 
 // --------------------------
 // Utilities
@@ -54,6 +103,14 @@ function choice<T>(arr: T[]): T {
 
 function classNames(...xs: Array<string | false | null | undefined>) {
   return xs.filter(Boolean).join(" ");
+}
+
+function getHasCompletedQuiz() {
+  try {
+    return localStorage.getItem(QUIZ_COMPLETED_KEY) === "true";
+  } catch {
+    return false;
+  }
 }
 
 // Generate a crisp SVG poster as a fallback when a photo is unavailable
@@ -92,9 +149,56 @@ function posterFor(model: string, type: string) {
 
 // Wikipedia API cache (in-memory + localStorage)
 const wikiCache: Record<string, string> = {};
+const decodedImageCache = new Set<string>();
+const COMMONS_EXTERIOR_SEARCH: Record<string, string> = {
+  "Gulfstream G650": "Gulfstream G650 aircraft exterior in flight",
+};
+const PREFERRED_AIRCRAFT_IMAGES: Record<string, string> = {
+  "Gulfstream G650":
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/d/d6/G-ULFS_Gulfstream_G650_CVT_05-05-16_%2827046023031%29_%28cropped%29.jpg/1280px-G-ULFS_Gulfstream_G650_CVT_05-05-16_%2827046023031%29_%28cropped%29.jpg",
+};
+
+function fetchWithTimeout(url: string, timeoutMs = 6000) {
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+  return fetch(url, { signal: controller.signal }).finally(() =>
+    window.clearTimeout(timeout)
+  );
+}
+
+function preloadImage(url: string, timeoutMs = 15000): Promise<void> {
+  if (decodedImageCache.has(url)) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    const timeout = window.setTimeout(() => {
+      image.src = "";
+      reject(new Error("Image download timed out"));
+    }, timeoutMs);
+
+    image.onload = async () => {
+      window.clearTimeout(timeout);
+      try {
+        if (image.decode) await image.decode();
+      } catch {
+        // A completed load is still safe to display if decode() is unsupported.
+      }
+      decodedImageCache.add(url);
+      resolve();
+    };
+    image.onerror = () => {
+      window.clearTimeout(timeout);
+      reject(new Error("Image download failed"));
+    };
+    image.src = url;
+  });
+}
 
 async function fetchWikipediaImage(model: string): Promise<string | null> {
-  const cacheKey = `wikiimg:${model}`;
+  if (PREFERRED_AIRCRAFT_IMAGES[model]) {
+    return PREFERRED_AIRCRAFT_IMAGES[model];
+  }
+  const cacheKey = `wikiimg:v2:${model}`;
   if (wikiCache[cacheKey]) return wikiCache[cacheKey];
   const ls = localStorage.getItem(cacheKey);
   if (ls) {
@@ -102,28 +206,96 @@ async function fetchWikipediaImage(model: string): Promise<string | null> {
     return ls;
   }
 
-  const tryTitles = [model, `${model} (aircraft)`, model.replaceAll("-", " ")];
-  for (const t of tryTitles) {
+  const exteriorSearch = COMMONS_EXTERIOR_SEARCH[model];
+  if (exteriorSearch) {
     try {
-      const url = `https://en.wikipedia.org/w/api.php?action=query&prop=pageimages&format=json&piprop=original|thumbnail&pithumbsize=1600&titles=${encodeURIComponent(
+      const url = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(
+        exteriorSearch
+      )}&gsrnamespace=6&gsrlimit=12&prop=imageinfo&iiprop=url|mime&iiurlwidth=1000&format=json&origin=*`;
+      const response = await fetchWithTimeout(url);
+      if (response.ok) {
+        const data = await response.json();
+        const pages = Object.values(data?.query?.pages || {}) as any[];
+        const exterior = pages
+          .map((page) => page?.imageinfo?.[0])
+          .find((info) => info?.mime?.startsWith("image/") && info?.thumburl);
+        const exteriorUrl = exterior?.thumburl || exterior?.url;
+        if (exteriorUrl) {
+          wikiCache[cacheKey] = exteriorUrl;
+          try {
+            localStorage.setItem(cacheKey, exteriorUrl);
+          } catch {
+            // Continue without persistent caching when storage is unavailable.
+          }
+          return exteriorUrl;
+        }
+      }
+    } catch {
+      // Do not fall back to an interior lead image for an exterior-only entry.
+    }
+    return null;
+  }
+
+  const tryTitles = [model, `${model} (aircraft)`, model.replaceAll("-", " ")];
+  const results = await Promise.all(
+    tryTitles.map(async (t) => {
+      try {
+      const url = `https://en.wikipedia.org/w/api.php?action=query&prop=pageimages&format=json&piprop=thumbnail|original&pithumbsize=1000&titles=${encodeURIComponent(
         t
       )}&origin=*`;
-      const res = await fetch(url);
-      if (!res.ok) continue;
+      const res = await fetchWithTimeout(url);
+      if (!res.ok) return null;
       const data = await res.json();
       const pages = data?.query?.pages || {};
       for (const k of Object.keys(pages)) {
         const p = pages[k];
-        const src = p?.original?.source || p?.thumbnail?.source;
-        if (src) {
-          wikiCache[cacheKey] = src;
-          localStorage.setItem(cacheKey, src);
-          return src;
-        }
+        const src = p?.thumbnail?.source || p?.original?.source;
+        if (src) return src as string;
       }
-    } catch (e) {
-      // ignore and try next title
+      return null;
+      } catch {
+        return null;
+      }
+    })
+  );
+
+  const src = results.find((result): result is string => !!result);
+  if (src) {
+    wikiCache[cacheKey] = src;
+    try {
+      localStorage.setItem(cacheKey, src);
+    } catch {
+      // Continue without persistent caching when storage is unavailable.
     }
+    return src;
+  }
+
+  // Some aircraft pages have no usable lead image. Search Wikimedia Commons
+  // directly so a valid photo can still be found for the aircraft.
+  try {
+    const searchUrl = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(
+      model
+    )}&gsrnamespace=6&gsrlimit=10&prop=imageinfo&iiprop=url|mime&iiurlwidth=1000&format=json&origin=*`;
+    const response = await fetchWithTimeout(searchUrl);
+    if (response.ok) {
+      const data = await response.json();
+      const pages = Object.values(data?.query?.pages || {}) as any[];
+      const image = pages
+        .map((page) => page?.imageinfo?.[0])
+        .find((info) => info?.mime?.startsWith("image/") && info?.thumburl);
+      const commonsUrl = image?.thumburl || image?.url;
+      if (commonsUrl) {
+        wikiCache[cacheKey] = commonsUrl;
+        try {
+          localStorage.setItem(cacheKey, commonsUrl);
+        } catch {
+          // Continue without persistent caching when storage is unavailable.
+        }
+        return commonsUrl;
+      }
+    }
+  } catch {
+    // The caller will try another aircraft or show the retry state.
   }
   return null;
 }
@@ -137,279 +309,6 @@ async function fetchImageForAircraft(a: Aircraft): Promise<string> {
 }
 
 // --------------------------
-// Data (concise, illustrative)
-// --------------------------
-export type Aircraft = {
-  id: string;
-  model: string;
-  type: "commercial" | "military" | "vintage" | "general";
-  wikiTitle?: string; // optional title override for Wikipedia
-  fact: string;
-  specs: {
-    role: string;
-    firstFlight?: string;
-    engines?: string;
-  };
-};
-
-const AIRCRAFT_DB: Aircraft[] = [
-  // Commercial
-  {
-    id: "b738",
-    model: "Boeing 737-800",
-    type: "commercial",
-    wikiTitle: "Boeing 737 Next Generation",
-    fact: "A best‑selling narrow‑body widely used for short to medium‑haul routes.",
-    specs: { role: "Narrow‑body airliner", engines: "2 × CFM56" },
-  },
-  {
-    id: "b38m",
-    model: "Boeing 737 MAX 8",
-    type: "commercial",
-    wikiTitle: "Boeing 737 MAX",
-    fact: "Re‑engined 737 variant with high‑bypass LEAP-1B engines.",
-    specs: { role: "Narrow‑body airliner", engines: "2 × LEAP‑1B" },
-  },
-  {
-    id: "b744",
-    model: "Boeing 747-400",
-    type: "commercial",
-    wikiTitle: "Boeing 747-400",
-    fact: "The iconic ‘Queen of the Skies’ with a distinctive upper deck.",
-    specs: { role: "Wide‑body airliner", engines: "4 × turbofan" },
-  },
-  {
-    id: "b77w",
-    model: "Boeing 777-300ER",
-    type: "commercial",
-    wikiTitle: "Boeing 777",
-    fact: "Long‑range twinjet known for efficiency and ETOPS prowess.",
-    specs: { role: "Wide‑body airliner", engines: "2 × GE90‑115B" },
-  },
-  {
-    id: "b789",
-    model: "Boeing 787-9",
-    type: "commercial",
-    wikiTitle: "Boeing 787 Dreamliner",
-    fact: "Composite‑rich Dreamliner with excellent range and cabin comfort.",
-    specs: { role: "Wide‑body airliner", engines: "2 × Trent 1000/GE NX" },
-  },
-  {
-    id: "a20n",
-    model: "Airbus A320neo",
-    type: "commercial",
-    wikiTitle: "Airbus A320neo family",
-    fact: "New engine option offering lower fuel burn and noise.",
-    specs: { role: "Narrow‑body airliner", engines: "2 × LEAP‑1A/PW1100G" },
-  },
-  {
-    id: "a21n",
-    model: "Airbus A321neo",
-    type: "commercial",
-    wikiTitle: "Airbus A321neo",
-    fact: "Stretched A320 family member popular for high‑density routes.",
-    specs: { role: "Narrow‑body airliner", engines: "2 × LEAP‑1A/PW1100G" },
-  },
-  {
-    id: "a339",
-    model: "Airbus A330‑900neo",
-    type: "commercial",
-    wikiTitle: "Airbus A330neo",
-    fact: "Modernized A330 with new wings and Rolls‑Royce Trent 7000 engines.",
-    specs: { role: "Wide‑body airliner", engines: "2 × Trent 7000" },
-  },
-  {
-    id: "a359",
-    model: "Airbus A350‑900",
-    type: "commercial",
-    wikiTitle: "Airbus A350",
-    fact: "Advanced composite twinjet with ultra‑long‑range variants.",
-    specs: { role: "Wide‑body airliner", engines: "2 × Trent XWB" },
-  },
-  {
-    id: "a388",
-    model: "Airbus A380‑800",
-    type: "commercial",
-    wikiTitle: "Airbus A380",
-    fact: "The world’s largest passenger airliner with two full‑length decks.",
-    specs: { role: "Very large airliner", engines: "4 × turbofan" },
-  },
-  {
-    id: "e190e2",
-    model: "Embraer E190‑E2",
-    type: "commercial",
-    wikiTitle: "Embraer E-Jet E2 family",
-    fact: "Second‑generation E‑Jet optimized for regional efficiency.",
-    specs: { role: "Regional jet", engines: "2 × PW1900G" },
-  },
-  {
-    id: "atr726",
-    model: "ATR 72‑600",
-    type: "commercial",
-    wikiTitle: "ATR 72",
-    fact: "Popular turboprop for short‑haul regional routes.",
-    specs: { role: "Regional turboprop", engines: "2 × PW127" },
-  },
-
-  // Military
-  {
-    id: "f16",
-    model: "F‑16 Fighting Falcon",
-    type: "military",
-    wikiTitle: "General Dynamics F-16 Fighting Falcon",
-    fact: "Agile multirole fighter famed for its bubble canopy and fly‑by‑wire.",
-    specs: { role: "Multirole fighter", engines: "1 × turbofan" },
-  },
-  {
-    id: "f22",
-    model: "F‑22 Raptor",
-    type: "military",
-    wikiTitle: "Lockheed Martin F-22 Raptor",
-    fact: "Stealth air‑superiority fighter with supercruise capability.",
-    specs: { role: "Stealth fighter", engines: "2 × turbofan" },
-  },
-  {
-    id: "f35",
-    model: "F‑35A Lightning II",
-    type: "military",
-    wikiTitle: "Lockheed Martin F-35 Lightning II",
-    fact: "Fifth‑gen stealth fighter with advanced sensor fusion.",
-    specs: { role: "Stealth multirole", engines: "1 × F135" },
-  },
-  {
-    id: "b2",
-    model: "B‑2 Spirit",
-    type: "military",
-    wikiTitle: "Northrop Grumman B-2 Spirit",
-    fact: "Flying‑wing stealth bomber designed for penetrating air defenses.",
-    specs: { role: "Stealth bomber", engines: "4 × turbofan" },
-  },
-  {
-    id: "c130j",
-    model: "C‑130J Super Hercules",
-    type: "military",
-    wikiTitle: "Lockheed Martin C-130J Super Hercules",
-    fact: "Tactical airlifter renowned for short and rough‑field performance.",
-    specs: { role: "Tactical transport", engines: "4 × turboprop" },
-  },
-  {
-    id: "typhoon",
-    model: "Eurofighter Typhoon",
-    type: "military",
-    wikiTitle: "Eurofighter Typhoon",
-    fact: "Delta‑canard multirole fighter developed by a European consortium.",
-    specs: { role: "Multirole fighter", engines: "2 × turbofan" },
-  },
-  {
-    id: "rafale",
-    model: "Dassault Rafale",
-    type: "military",
-    wikiTitle: "Dassault Rafale",
-    fact: "Carrier‑capable multirole fighter with high agility and payload.",
-    specs: { role: "Multirole fighter", engines: "2 × turbofan" },
-  },
-
-  // Vintage
-  {
-    id: "dc3",
-    model: "Douglas DC‑3",
-    type: "vintage",
-    wikiTitle: "Douglas DC-3",
-    fact: "Revolutionized air transport in the 1930s and 40s.",
-    specs: { role: "Piston airliner", engines: "2 × radial" },
-  },
-  {
-    id: "constellation",
-    model: "Lockheed Constellation",
-    type: "vintage",
-    wikiTitle: "Lockheed Constellation",
-    fact: "Elegant triple‑tail piston airliner of the golden age.",
-    specs: { role: "Piston airliner", engines: "4 × radial" },
-  },
-  {
-    id: "707",
-    model: "Boeing 707",
-    type: "vintage",
-    wikiTitle: "Boeing 707",
-    fact: "Early successful jet airliner that popularized intercontinental jet travel.",
-    specs: { role: "Jet airliner", engines: "4 × turbojet/turbofan" },
-  },
-  {
-    id: "comet",
-    model: "de Havilland Comet",
-    type: "vintage",
-    wikiTitle: "de Havilland Comet",
-    fact: "World’s first commercial jet airliner (lessons reshaped fatigue design).",
-    specs: { role: "Jet airliner", engines: "4 × turbojet" },
-  },
-  {
-    id: "concorde",
-    model: "Concorde",
-    type: "vintage",
-    wikiTitle: "Concorde",
-    fact: "Supersonic airliner cruising at Mach 2 with a droop nose.",
-    specs: { role: "Supersonic airliner", engines: "4 × Olympus" },
-  },
-  {
-    id: "spitfire",
-    model: "Supermarine Spitfire",
-    type: "vintage",
-    wikiTitle: "Supermarine Spitfire",
-    fact: "Iconic elliptical‑wing WWII fighter.",
-    specs: { role: "WWII fighter", engines: "1 × Merlin/Griffon" },
-  },
-  {
-    id: "p51",
-    model: "North American P‑51 Mustang",
-    type: "vintage",
-    wikiTitle: "North American P-51 Mustang",
-    fact: "Long‑range WWII escort fighter renowned for performance.",
-    specs: { role: "WWII fighter", engines: "1 × Merlin" },
-  },
-
-  // General aviation
-  {
-    id: "c172",
-    model: "Cessna 172 Skyhawk",
-    type: "general",
-    wikiTitle: "Cessna 172",
-    fact: "One of the most produced aircraft ever; a pilot trainer staple.",
-    specs: { role: "GA trainer", engines: "1 × piston" },
-  },
-  {
-    id: "sr22",
-    model: "Cirrus SR22",
-    type: "general",
-    wikiTitle: "Cirrus SR22",
-    fact: "High‑performance GA aircraft with whole‑airframe parachute.",
-    specs: { role: "GA", engines: "1 × piston" },
-  },
-  {
-    id: "kingair350",
-    model: "Beechcraft King Air 350",
-    type: "general",
-    wikiTitle: "Beechcraft King Air",
-    fact: "Popular twin‑turboprop for business and utility roles.",
-    specs: { role: "GA turboprop", engines: "2 × PT6A" },
-  },
-  {
-    id: "da42",
-    model: "Diamond DA42",
-    type: "general",
-    wikiTitle: "Diamond DA42 Twin Star",
-    fact: "Modern composite twin notable for efficiency.",
-    specs: { role: "GA twin", engines: "2 × diesel" },
-  },
-];
-
-const TYPES: Array<Aircraft["type"]> = [
-  "commercial",
-  "military",
-  "vintage",
-  "general",
-];
-
-// --------------------------
 // Hooks
 // --------------------------
 function useCountdown(
@@ -421,22 +320,28 @@ function useCountdown(
   const [timeLeft, setTimeLeft] = useState(seconds);
   const startedAt = useRef<number | null>(null);
   const raf = useRef<number | null>(null);
+  const onElapsedRef = useRef(onElapsed);
+
+  useEffect(() => {
+    onElapsedRef.current = onElapsed;
+  }, [onElapsed]);
 
   // Reset timer when seconds or restartKey changes
   useEffect(() => {
     setTimeLeft(seconds);
-    startedAt.current = performance.now();
+    startedAt.current = null;
   }, [seconds, restartKey]);
 
   useEffect(() => {
     if (!isRunning) return;
+    startedAt.current = performance.now();
     const tick = () => {
       if (startedAt.current == null) return;
       const elapsed = (performance.now() - startedAt.current) / 1000;
       const left = Math.max(0, seconds - elapsed);
       setTimeLeft(left);
       if (left <= 0) {
-        onElapsed();
+        onElapsedRef.current();
         return;
       }
       raf.current = requestAnimationFrame(tick);
@@ -445,7 +350,7 @@ function useCountdown(
     return () => {
       if (raf.current) cancelAnimationFrame(raf.current);
     };
-  }, [isRunning, onElapsed, seconds]);
+  }, [isRunning, seconds, restartKey]);
 
   return timeLeft;
 }
@@ -466,9 +371,7 @@ export default function AirplaneQuizApp() {
     general: true,
   });
   const questionTimeSec = QUIZ_DEFAULTS.questionTimeSec; // fixed, not user-editable
-  const [questionsPerRun, setQuestionsPerRun] = useState(
-    QUIZ_DEFAULTS.questionsPerRun
-  );
+  const questionsPerRun = QUIZ_DEFAULTS.questionsPerRun; // fixed, not user-editable
 
   // Quiz runtime state
   const [questionIndex, setQuestionIndex] = useState(0);
@@ -478,11 +381,18 @@ export default function AirplaneQuizApp() {
     imageUrl: string | null;
     questionKey: number;
   } | null>(null);
+  const [questionStatus, setQuestionStatus] = useState<
+    "idle" | "loading" | "ready" | "error"
+  >("idle");
+  const [imageLoadError, setImageLoadError] = useState("");
+  const questionRequestRef = useRef(0);
+  const warmupPromiseRef = useRef<Promise<void> | null>(null);
+  const warmedImagesRef = useRef<Set<string>>(new Set());
 
   const [locked, setLocked] = useState(false);
   const [feedback, setFeedback] = useState<
     | null
-    | { correct: boolean; fact: string; correctModel: string; points: number }
+    | { correct: boolean; fact: string; correctModel: string; points: number; selectedId?: string }
   >(null);
 
   const [score, setScore] = useState(0);
@@ -499,67 +409,129 @@ export default function AirplaneQuizApp() {
     return AIRCRAFT_DB.filter((a) => enabled.has(a.type));
   }, [enabledTypes]);
 
-  // Leaderboard (local)
-  const [leaderboard, setLeaderboard] = useState<
-    Array<{ name: string; score: number; date: string }>
-  >(() => {
+  async function warmAircraftImages(aircraft: Aircraft[], count = IMAGE_WARM_QUEUE_SIZE) {
+    const targets = shuffle(aircraft).slice(0, count);
+    await Promise.all(targets.map(async (item) => {
+      try {
+        const url = IMAGE_SOURCE === "internal"
+          ? posterFor(item.model, item.type)
+          : await fetchWikipediaImage(item.wikiTitle || item.model);
+        if (!url || warmedImagesRef.current.has(url)) return;
+        await preloadImage(url);
+        warmedImagesRef.current.add(url);
+      } catch {
+        // Demand loading will retry any image that could not be warmed.
+      }
+    }));
+  }
+
+  useEffect(() => {
+    if (screen !== "menu" || filteredDB.length < OPTIONS_PER_QUESTION) return;
+    if (!warmupPromiseRef.current) {
+      warmupPromiseRef.current = warmAircraftImages(filteredDB).finally(() => {
+        warmupPromiseRef.current = null;
+      });
+    }
+  }, [screen, filteredDB]);
+
+  // Global leaderboard with a local offline fallback.
+  const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>(() => {
     try {
-      return JSON.parse(localStorage.getItem("airquiz_leaderboard_v1") || "[]");
+      return JSON.parse(localStorage.getItem(LOCAL_LEADERBOARD_KEY) || "[]");
     } catch {
       return [];
     }
   });
+  const [leaderboardOnline, setLeaderboardOnline] = useState(false);
   const [askName, setAskName] = useState<string | null>(null);
 
+  async function refreshGlobalLeaderboard() {
+    try {
+      const response = await fetch("/api/leaderboard", { headers: { Accept: "application/json" } });
+      if (!response.ok) throw new Error("Leaderboard unavailable");
+      const data = await response.json();
+      if (!Array.isArray(data?.leaderboard)) throw new Error("Invalid leaderboard response");
+      setLeaderboard(data.leaderboard);
+      setLeaderboardOnline(true);
+    } catch {
+      setLeaderboardOnline(false);
+    }
+  }
+
+  useEffect(() => {
+    void refreshGlobalLeaderboard();
+  }, []);
+
   const [showLeaderboard, setShowLeaderboard] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showQuitConfirm, setShowQuitConfirm] = useState(false);
+  const [hasCompletedQuiz, setHasCompletedQuiz] = useState(() =>
+    getHasCompletedQuiz()
+  );
 
   // Generate next question
   async function nextQuestion(resetKey = false) {
     if (filteredDB.length < OPTIONS_PER_QUESTION) return;
+    const requestId = ++questionRequestRef.current;
+    setCurrent(null);
+    setQuestionStatus("loading");
+    setImageLoadError("");
 
-    // Pick a correct aircraft not seen this session
     let pool = filteredDB.filter((a) => !seenIdsRef.current.has(a.id));
     if (pool.length === 0) {
       seenIdsRef.current.clear();
       pool = filteredDB;
     }
-    const correct = choice(pool);
 
-    const distractorsPool = filteredDB.filter((a) => a.id !== correct.id);
-    const distractors = shuffle(distractorsPool).slice(
-      0,
-      OPTIONS_PER_QUESTION - 1
-    );
-    const options = shuffle([correct, ...distractors]);
-    console.assert(
-      options.length === OPTIONS_PER_QUESTION,
-      "options length should be 4"
-    );
+    // Try several aircraft so one broken remote photo does not block the run.
+    const candidates = shuffle(pool).slice(0, Math.min(4, pool.length));
+    for (const correct of candidates) {
+      try {
+        const distractors = shuffle(
+          filteredDB.filter((a) => a.id !== correct.id)
+        ).slice(0, OPTIONS_PER_QUESTION - 1);
+        const options = shuffle([correct, ...distractors]);
+        const questionKey = resetKey ? Date.now() : Math.random();
+        setCurrent({ correct, options, imageUrl: null, questionKey });
 
-    // Load image (Wikipedia or poster)
-    const imageUrl = await fetchImageForAircraft(correct);
+        const imageUrl =
+          IMAGE_SOURCE === "internal"
+            ? posterFor(correct.model, correct.type)
+            : await fetchWikipediaImage(correct.wikiTitle || correct.model);
+        if (!imageUrl || seenPhotosRef.current.has(imageUrl)) continue;
 
-    // Ensure no exact photo repeats within a session
-    let finalUrl = imageUrl;
-    if (seenPhotosRef.current.has(finalUrl)) {
-      let attempts = 0;
-      while (attempts < 4 && seenPhotosRef.current.has(finalUrl)) {
-        const alt = choice(filteredDB);
-        finalUrl = await fetchImageForAircraft(alt);
-        attempts++;
+        // This downloads and decodes the actual image before the timer can start.
+        await preloadImage(imageUrl);
+        if (requestId !== questionRequestRef.current) return;
+
+        seenPhotosRef.current.add(imageUrl);
+        setCurrent({
+          correct,
+          options,
+          imageUrl,
+          questionKey,
+        });
+        setQuestionStatus("ready");
+        void warmAircraftImages(
+          filteredDB.filter((aircraft) => aircraft.id !== correct.id),
+          IMAGE_WARM_QUEUE_SIZE
+        );
+        return;
+      } catch {
+        // Try another aircraft before showing a recoverable error.
       }
     }
-    seenPhotosRef.current.add(finalUrl);
 
-    setCurrent({
-      correct,
-      options,
-      imageUrl: finalUrl,
-      questionKey: resetKey ? Date.now() : Math.random(),
-    });
+    if (requestId === questionRequestRef.current) {
+      setQuestionStatus("error");
+      setImageLoadError(
+        "We couldn't load an aircraft photo. Check your connection and try again—your timer has not started."
+      );
+    }
   }
 
   function resetRun() {
+    questionRequestRef.current += 1;
     setScore(0);
     setStreak(0);
     setBestStreak(0);
@@ -568,18 +540,22 @@ export default function AirplaneQuizApp() {
     setQuestionIndex(0);
     seenIdsRef.current.clear();
     seenPhotosRef.current.clear();
+    setCurrent(null);
+    setQuestionStatus("idle");
+    setImageLoadError("");
   }
 
   async function startQuiz() {
     resetRun();
     setScreen("quiz");
+    if (warmupPromiseRef.current) await warmupPromiseRef.current;
     await nextQuestion(true);
   }
 
   // Timer
   const timeLeft = useCountdown(
     questionTimeSec,
-    screen === "quiz" && !!current && !locked,
+    screen === "quiz" && questionStatus === "ready" && !!current && !locked,
     () => {
       if (locked || !current) return;
       // Time out => incorrect
@@ -590,6 +566,7 @@ export default function AirplaneQuizApp() {
         fact,
         correctModel: current.correct?.model || "",
         points: 0,
+        selectedId: undefined,
       });
       // mark this id as seen to avoid repeats
       if (current?.correct?.id) seenIdsRef.current.add(current.correct.id);
@@ -622,28 +599,44 @@ export default function AirplaneQuizApp() {
       fact,
       correctModel: current.correct!.model,
       points: awarded,
+      selectedId: a.id,
     });
     seenIdsRef.current.add(current.correct!.id);
   }
 
   async function handleNext() {
     setFeedback(null);
-    setLocked(false);
+    setLocked(true);
     const nextIdx = questionIndex + 1;
     if (nextIdx >= questionsPerRun) {
       // End of run -> save leaderboard
       const maybeTop = isTopScore(score, leaderboard);
-      if (maybeTop) setAskName(defaultPlayerName());
+      setHasCompletedQuiz(true);
+      localStorage.setItem(QUIZ_COMPLETED_KEY, "true");
+      if (maybeTop) setAskName(getAnonymousProfile().username);
       setScreen("result");
       return;
     }
     setQuestionIndex(nextIdx);
+    setLocked(false);
     await nextQuestion();
   }
 
-  function saveLeaderboard(name: string) {
+  function handleImageRenderError() {
+    questionRequestRef.current += 1;
+    setLocked(true);
+    setCurrent(null);
+    setQuestionStatus("error");
+    setImageLoadError(
+      "The aircraft photo became unavailable. Try loading this question again—no time was deducted."
+    );
+  }
+
+  async function saveLeaderboard(name: string) {
+    const cleanName = name.trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 24) || generateCallsign();
+    let profile = saveAnonymousUsername(cleanName);
     const entry = {
-      name: name.trim() || "Pilot",
+      name: profile.username,
       score,
       date: new Date().toISOString(),
     };
@@ -651,26 +644,53 @@ export default function AirplaneQuizApp() {
       .sort((a, b) => b.score - a.score)
       .slice(0, 10);
     setLeaderboard(updated);
-    localStorage.setItem("airquiz_leaderboard_v1", JSON.stringify(updated));
+    localStorage.setItem(LOCAL_LEADERBOARD_KEY, JSON.stringify(updated));
+
+    const submit = async () => fetch("/api/scores", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        name: profile.username,
+        score,
+        bestStreak,
+        deviceId: profile.deviceId,
+      }),
+    });
+
+    try {
+      let response = await submit();
+      if (response.status === 409) {
+        profile = saveAnonymousUsername(generateCallsign());
+        response = await submit();
+      }
+      if (!response.ok) throw new Error("Score submission failed");
+      await refreshGlobalLeaderboard();
+    } catch {
+      setLeaderboardOnline(false);
+    }
   }
 
   function resetLeaderboard() {
     setLeaderboard([]);
-    localStorage.removeItem("airquiz_leaderboard_v1");
+    localStorage.removeItem(LOCAL_LEADERBOARD_KEY);
   }
 
-  const progressPct = useMemo(
-    () =>
-      Math.round(
-        ((questionIndex + (feedback ? 1 : 0)) / questionsPerRun) * 100
-      ),
-    [questionIndex, questionsPerRun, feedback]
-  );
-
   return (
-    <div className="min-h-screen w-full bg-slate-950 text-slate-100">
+    <div
+      className={classNames(
+        "min-h-screen w-full bg-slate-950 text-slate-100",
+        screen === "learn"
+          ? "overflow-y-auto"
+          : screen === "quiz"
+            ? "h-dvh overflow-hidden"
+            : "overflow-x-hidden"
+      )}
+    >
       <TopBar
-        onOpenLeaderboard={() => setShowLeaderboard(true)}
+        onOpenLeaderboard={() => {
+          setShowLeaderboard(true);
+          void refreshGlobalLeaderboard();
+        }}
         score={score}
         streak={streak}
         screen={screen}
@@ -679,17 +699,21 @@ export default function AirplaneQuizApp() {
       {screen === "menu" && (
         <MenuScreen
           enabledTypes={enabledTypes}
-          setEnabledTypes={setEnabledTypes}
           questionsPerRun={questionsPerRun}
-          setQuestionsPerRun={setQuestionsPerRun}
+          questionTimeSec={questionTimeSec}
+          aircraftCount={filteredDB.length}
+          hasCompletedQuiz={hasCompletedQuiz}
           onStart={startQuiz}
-          onLearn={() => setScreen("learn")}
+          onLearn={() => {
+            if (hasCompletedQuiz) setScreen("learn");
+          }}
+          onOpenSettings={() => setShowSettings(true)}
         />
       )}
 
-      {screen === "quiz" && current && (
+      {screen === "quiz" && (
         <QuizScreen
-          key={current.questionKey}
+          key={current?.questionKey}
           current={current}
           questionIndex={questionIndex}
           totalQuestions={questionsPerRun}
@@ -699,7 +723,14 @@ export default function AirplaneQuizApp() {
           onNext={handleNext}
           locked={locked}
           feedback={feedback}
-          progressPct={progressPct}
+          onImageError={handleImageRenderError}
+          loading={questionStatus !== "ready"}
+          loadError={questionStatus === "error" ? imageLoadError : ""}
+          onRetry={() => {
+            setLocked(false);
+            nextQuestion();
+          }}
+          onQuit={() => setShowQuitConfirm(true)}
         />
       )}
 
@@ -717,14 +748,36 @@ export default function AirplaneQuizApp() {
           db={AIRCRAFT_DB}
           enabledTypes={enabledTypes}
           setEnabledTypes={setEnabledTypes}
+          onBackToMenu={() => setScreen("menu")}
         />
       )}
 
       {showLeaderboard && (
         <LeaderboardModal
           leaderboard={leaderboard}
+          online={leaderboardOnline}
           onClose={() => setShowLeaderboard(false)}
           onReset={resetLeaderboard}
+        />
+      )}
+
+      {showSettings && (
+        <SettingsModal
+          enabledTypes={enabledTypes}
+          setEnabledTypes={setEnabledTypes}
+          onClose={() => setShowSettings(false)}
+        />
+      )}
+
+      {showQuitConfirm && (
+        <ConfirmQuitModal
+          onCancel={() => setShowQuitConfirm(false)}
+          onConfirm={() => {
+            setShowQuitConfirm(false);
+            resetRun();
+            setCurrent(null);
+            setScreen("menu");
+          }}
         />
       )}
 
@@ -757,28 +810,47 @@ function TopBar({
   onOpenLeaderboard: () => void;
 }) {
   return (
-    <header className="sticky top-0 z-20 border-b border-slate-800 bg-slate-950/80 backdrop-blur">
-      <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-3">
-        <div className="flex items-center gap-3">
-          <div className="h-8 w-8 rounded-lg bg-sky-500/20 ring-1 ring-sky-400/40" />
-          <h1 className="text-lg font-semibold tracking-tight">
-            Airplane <span className="text-sky-400">Spotter</span>
-          </h1>
-        </div>
-        <div className="flex items-center gap-4 text-sm">
-          <div className="hidden sm:flex items-center gap-2">
-            <span className="text-slate-400">Score</span>
-            <span className="rounded bg-slate-800 px-2 py-1 font-semibold">{score}</span>
+    <header className={classNames(
+      "sticky top-0 z-20 border-b border-slate-800/80 bg-slate-950/90 backdrop-blur",
+      screen === "quiz" ? "h-14" : "h-16"
+    )}>
+      <div className="mx-auto flex h-full max-w-[96rem] items-center justify-between px-3 sm:px-5">
+        <div className="flex min-w-0 items-center gap-3">
+          <div className="h-10 w-10 shrink-0 overflow-hidden rounded-xl shadow-lg shadow-sky-950/40 sm:h-11 sm:w-11">
+            <img src="/app-icon.png" alt="Airplane Spotter" className="h-full w-full object-cover" />
           </div>
-          <div className="hidden sm:flex items-center gap-2">
-            <span className="text-slate-400">Streak</span>
-            <span className="rounded bg-slate-800 px-2 py-1 font-semibold">{streak}🔥</span>
+          <div className="min-w-0">
+            <h1 className="truncate text-base font-black uppercase tracking-[0.08em] text-white sm:text-xl sm:tracking-[0.12em]">
+              Airplane <span className="text-sky-400">Spotter</span>
+            </h1>
+            <div className="hidden text-xs font-bold uppercase tracking-[0.22em] text-slate-400 sm:block">
+              Recognize. Learn. Spot.
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 text-sm sm:gap-3">
+          <div className="hidden items-center gap-2 rounded-xl border border-slate-700/80 bg-slate-900/70 px-4 py-2 sm:flex">
+            <span className="font-bold text-slate-400">Score</span>
+            <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 text-amber-300" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
+              <path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6-5.4-2.9-5.4 2.9 1-6-4.4-4.3 6.1-.9L12 3Z" />
+            </svg>
+            <span className="font-black text-white">{score}</span>
+          </div>
+          <div className="hidden items-center gap-2 rounded-xl border border-slate-700/80 bg-slate-900/70 px-4 py-2 sm:flex">
+            <span className="font-bold text-slate-400">Streak</span>
+            <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 text-orange-400" fill="currentColor">
+              <path d="M13.7 2.4c.4 3.2-1.6 4.8-3.4 6.5-1.6 1.5-3.1 2.9-3.1 5.4A4.8 4.8 0 0 0 12 19.1a4.8 4.8 0 0 0 4.8-4.8c0-1.9-.9-3.4-2.1-4.8-.2 1.7-1.1 2.9-2.4 3.9.5-2.6-.1-4.7-1.9-6.3 2.2-1.1 3.3-2.7 3.3-4.7Z" />
+            </svg>
+            <span className="font-black text-white">{streak}</span>
           </div>
           <button
             onClick={onOpenLeaderboard}
-            className="rounded-md border border-slate-800 bg-slate-900 px-3 py-1.5 text-xs font-medium hover:border-sky-600/40 hover:bg-slate-900/80"
+            className="inline-flex items-center gap-2 rounded-xl border border-slate-700/90 bg-slate-900/70 px-3 py-2 text-xs font-black text-white shadow-lg shadow-black/20 transition hover:border-sky-500/60 hover:bg-slate-900 sm:px-4"
           >
-            Leaderboard
+            <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor">
+              <path d="M18 3h2a1 1 0 0 1 1 1v2a5 5 0 0 1-4.2 4.9A6 6 0 0 1 13 14.9V18h3a1 1 0 1 1 0 2H8a1 1 0 1 1 0-2h3v-3.1a6 6 0 0 1-3.8-4A5 5 0 0 1 3 6V4a1 1 0 0 1 1-1h2V2h12v1Zm0 2v3.7A3 3 0 0 0 19 6V5h-1ZM5 5v1a3 3 0 0 0 1 2.2V5H5Z" />
+            </svg>
+            <span className="hidden sm:inline">Leaderboard</span>
           </button>
         </div>
       </div>
@@ -786,100 +858,388 @@ function TopBar({
   );
 }
 
+function StatCard({
+  value,
+  label,
+  tone,
+  icon,
+  iconImageSrc,
+}: {
+  value: string | number;
+  label: string;
+  tone: "blue" | "emerald" | "violet";
+  icon: React.ReactNode;
+  iconImageSrc?: string;
+}) {
+  const tones = {
+    blue: "bg-blue-600/30 text-blue-300",
+    emerald: "bg-emerald-500/25 text-emerald-300",
+    violet: "bg-violet-600/30 text-violet-300",
+  };
+
+  return (
+    <div className="flex min-w-0 items-center gap-3 rounded-2xl border border-sky-800/60 bg-slate-950/55 p-3 shadow-lg shadow-black/20 backdrop-blur sm:gap-4 sm:p-4 xl:p-5">
+      <span className={classNames("flex h-10 w-10 shrink-0 items-center justify-center rounded-full sm:h-12 sm:w-12 xl:h-14 xl:w-14", tones[tone])}>
+        {iconImageSrc ? (
+          <img src={iconImageSrc} alt="" className="h-full w-full rounded-full object-cover" />
+        ) : (
+          <svg
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+            className="h-5 w-5 sm:h-6 sm:w-6 xl:h-7 xl:w-7"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            {icon}
+          </svg>
+        )}
+      </span>
+      <div className="min-w-0">
+        <div className="text-2xl font-black leading-none text-white sm:text-3xl xl:text-4xl">{value}</div>
+        <div className="mt-1 break-words text-[0.65rem] font-bold uppercase leading-tight tracking-[0.08em] text-slate-300 sm:mt-2 sm:text-xs sm:tracking-[0.12em]">{label}</div>
+      </div>
+    </div>
+  );
+}
+
+function ChecklistItem({
+  number,
+  title,
+  body,
+  icon,
+  iconImageSrc,
+}: {
+  number: string;
+  title: string;
+  body: string;
+  icon: React.ReactNode;
+  iconImageSrc?: string;
+}) {
+  return (
+    <div className="grid grid-cols-[auto_auto_1fr] items-center gap-3 rounded-2xl border border-sky-900/70 bg-slate-950/55 p-3 xl:gap-4 xl:p-4">
+      <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-blue-600 text-sm font-black text-white shadow-lg shadow-blue-950/40 xl:h-11 xl:w-11 xl:text-lg">
+        {number}
+      </span>
+      <span className="flex h-9 w-9 items-center justify-center text-blue-400 xl:h-11 xl:w-11">
+        {iconImageSrc ? (
+          <img src={iconImageSrc} alt="" className="h-8 w-8 rounded-lg object-cover xl:h-10 xl:w-10" />
+        ) : (
+          <svg
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+            className="h-6 w-6 xl:h-8 xl:w-8"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            {icon}
+          </svg>
+        )}
+      </span>
+      <div>
+        <div className="text-xs font-black uppercase tracking-wide text-white xl:text-sm">{title}</div>
+        <p className="mt-1 text-xs leading-5 text-slate-300 xl:mt-2 xl:text-sm xl:leading-6">{body}</p>
+      </div>
+    </div>
+  );
+}
+
 function MenuScreen({
   enabledTypes,
-  setEnabledTypes,
   questionsPerRun,
-  setQuestionsPerRun,
+  questionTimeSec,
+  aircraftCount,
+  hasCompletedQuiz,
   onStart,
   onLearn,
+  onOpenSettings,
 }: any) {
-  return (
-    <div className="mx-auto grid max-w-6xl grid-cols-1 gap-6 px-4 py-8 lg:grid-cols-2">
-      <div className="space-y-6">
-        <section className="rounded-2xl border border-slate-800 bg-slate-900/40 p-6">
-          <h2 className="mb-4 text-xl font-semibold">Choose aircraft types</h2>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-            {TYPES.map((t) => (
-              <label
-                key={t}
-                className={classNames(
-                  "group flex cursor-pointer items-center justify-between gap-2 rounded-xl border p-3 text-sm",
-                  enabledTypes[t]
-                    ? "border-sky-600/40 bg-sky-500/10"
-                    : "border-slate-800 bg-slate-900/40"
-                )}
-              >
-                <span className="capitalize">{t}</span>
-                <input
-                  type="checkbox"
-                  className="accent-sky-500"
-                  checked={enabledTypes[t]}
-                  onChange={(e) =>
-                    setEnabledTypes((s: any) => ({ ...s, [t]: e.target.checked }))
-                  }
-                />
-              </label>
-            ))}
-          </div>
-        </section>
+  const activeTypes = TYPES.filter((t) => enabledTypes[t]);
+  const canStart = aircraftCount >= OPTIONS_PER_QUESTION;
+  const [learnHint, setLearnHint] = useState(false);
 
-        <section className="rounded-2xl border border-slate-800 bg-slate-900/40 p-6">
-          <h2 className="mb-4 text-xl font-semibold">Game options</h2>
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            <div>
-              <label className="mb-2 block text-sm text-slate-300">
-                Questions per round
-              </label>
-              <input
-                type="range"
-                min={5}
-                max={20}
-                value={questionsPerRun}
-                onChange={(e) => setQuestionsPerRun(parseInt(e.target.value))}
-                className="w-full accent-sky-500"
-              />
-              <div className="mt-1 text-xs text-slate-400">
-                {questionsPerRun} questions
+  return (
+    <main className="menu-screen mx-auto max-w-[96rem] px-3 py-3 sm:px-5 sm:py-5 xl:min-h-[calc(100dvh-4rem)]">
+      <section className="rounded-[1.5rem] border border-sky-900/60 bg-slate-950/80 p-3 shadow-2xl shadow-black/40 sm:rounded-[2rem] xl:min-h-[calc(100dvh-6rem)] xl:p-4">
+        <div className="grid gap-4 xl:grid-cols-[1.5fr_0.95fr] xl:gap-5">
+          <div
+            className="relative overflow-hidden rounded-3xl border border-sky-800/60 bg-slate-900 p-4 shadow-2xl shadow-sky-950/20 sm:p-6 xl:min-h-[calc(100dvh-8rem)] xl:p-8"
+            style={{
+              backgroundImage:
+                "linear-gradient(90deg, rgba(2,6,23,0.98) 0%, rgba(2,6,23,0.86) 42%, rgba(2,6,23,0.26) 100%), linear-gradient(0deg, rgba(2,6,23,0.9), rgba(2,6,23,0.08) 54%), url('https://images.unsplash.com/photo-1436491865332-7a61a109cc05?auto=format&fit=crop&w=1600&q=80')",
+              backgroundPosition: "center",
+              backgroundSize: "cover",
+            }}
+          >
+            <div className="relative z-10 flex min-h-[34rem] flex-col justify-between gap-8 sm:min-h-[38rem] xl:min-h-[calc(100dvh-12rem)] xl:gap-4">
+              <div>
+                <div className="mb-3 inline-flex items-center gap-2 rounded-2xl border border-sky-500/30 bg-blue-600/20 px-3 py-1.5 text-[0.65rem] font-black uppercase tracking-[0.16em] text-sky-200 sm:mb-5 sm:px-4 sm:py-2 sm:text-xs xl:mb-7">
+                  <span className="flex h-7 w-7 items-center justify-center rounded-full bg-blue-500/70 sm:h-8 sm:w-8">
+                    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4 text-white sm:h-5 sm:w-5" fill="currentColor">
+                      <path d="m12 2 2.4 6.6L21 11l-6.6 2.4L12 20l-2.4-6.6L3 11l6.6-2.4L12 2Z" />
+                    </svg>
+                  </span>
+                  Aircraft recognition quiz
+                </div>
+                <h2 className="max-w-[42rem] text-3xl font-black leading-[1.04] tracking-tight text-white drop-shadow-lg sm:text-5xl xl:text-6xl">
+                  Identify the <span className="text-blue-400">aircraft</span>{" "}
+                  before the timer runs out.
+                </h2>
+                <p className="mt-3 max-w-md text-sm leading-6 text-slate-300 sm:mt-5 sm:text-base sm:leading-7 xl:mt-6 xl:text-lg xl:leading-8">
+                  A fast and fun quiz to test your knowledge of aircraft
+                  silhouettes, engines, tails, and more.
+                </p>
+              </div>
+
+              <div>
+                <div className="grid grid-cols-1 gap-2 min-[520px]:grid-cols-3 sm:gap-3 xl:gap-4">
+                  <StatCard
+                    value={questionsPerRun}
+                    label="Questions"
+                    tone="blue"
+                    icon={
+                      <path d="M7 3h10a2 2 0 0 1 2 2v14l-4-2-3 2-3-2-4 2V5a2 2 0 0 1 2-2Zm2 5h6M9 12h6" />
+                    }
+                  />
+                  <StatCard
+                    value={`${questionTimeSec}s`}
+                    label="Per question"
+                    tone="emerald"
+                    icon={
+                      <>
+                        <path d="M12 7v5l3 2" />
+                        <path d="M9 2h6" />
+                        <path d="M12 22a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z" />
+                      </>
+                    }
+                  />
+                  <StatCard
+                    value="100+"
+                    label="Aircraft pool"
+                    tone="violet"
+                    icon={null}
+                    iconImageSrc="/app-icon.png"
+                  />
+                </div>
+
+                <div className="mt-3 border-t border-sky-900/50 pt-3 sm:mt-5 sm:pt-5 xl:mt-8 xl:pt-8">
+                  <div className="grid grid-cols-1 gap-2 min-[520px]:grid-cols-[1fr_1fr_auto] sm:gap-3 xl:gap-4">
+                    <button
+                      onClick={onStart}
+                      disabled={!canStart}
+                      className="inline-flex min-h-12 items-center justify-center gap-2 rounded-xl bg-blue-600 px-3 py-3 text-sm font-black text-white shadow-xl shadow-blue-950/40 transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400 sm:min-h-14 sm:text-base xl:min-h-[4.4rem] xl:gap-3 xl:px-7 xl:text-lg"
+                    >
+                      <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 xl:h-6 xl:w-6" fill="currentColor">
+                        <path d="M8 5v14l11-7L8 5Z" />
+                      </svg>
+                      Start Quiz
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (hasCompletedQuiz) {
+                          onLearn();
+                        } else {
+                          setLearnHint(true);
+                        }
+                      }}
+                      onMouseEnter={() => !hasCompletedQuiz && setLearnHint(true)}
+                      onFocus={() => !hasCompletedQuiz && setLearnHint(true)}
+                      onMouseLeave={() => setLearnHint(false)}
+                      onBlur={() => setLearnHint(false)}
+                      aria-describedby={!hasCompletedQuiz ? "learn-mode-hint" : undefined}
+                      className={classNames(
+                        "relative inline-flex min-h-12 items-center justify-center gap-2 rounded-xl border px-3 py-3 text-sm font-black transition sm:min-h-14 sm:text-base xl:min-h-[4.4rem] xl:gap-3 xl:px-7 xl:text-lg",
+                        hasCompletedQuiz
+                          ? "border-sky-800/80 bg-slate-950/60 text-slate-100 hover:border-blue-500/70 hover:bg-slate-900"
+                          : "border-slate-700/80 bg-slate-950/50 text-slate-500 hover:border-blue-500/40"
+                      )}
+                    >
+                      <svg aria-hidden="true" viewBox="0 0 24 24" className="hidden h-5 w-5 text-blue-400 sm:block xl:h-6 xl:w-6" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+                        <path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15Z" />
+                      </svg>
+                      <span className="hidden sm:inline">Learn Mode</span>
+                      <span className="sm:hidden">Learn</span>
+                      {!hasCompletedQuiz && learnHint && (
+                        <span
+                          id="learn-mode-hint"
+                          className="absolute left-1/2 top-full z-10 mt-2 w-48 -translate-x-1/2 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-xs font-medium leading-5 text-slate-200 shadow-xl shadow-black/30"
+                        >
+                          Play one quiz to unlock.
+                        </span>
+                      )}
+                    </button>
+                    <button
+                      onClick={onOpenSettings}
+                      aria-label="Open settings"
+                      title="Settings"
+                      className="inline-flex min-h-12 w-full items-center justify-center rounded-xl border border-sky-800/80 bg-slate-950/60 py-3 text-slate-100 transition hover:border-blue-500/70 hover:bg-slate-900 min-[520px]:w-12 sm:min-h-14 sm:w-14 xl:min-h-[4.4rem] xl:w-[4.4rem]"
+                    >
+                      <svg
+                        aria-hidden="true"
+                        viewBox="0 0 24 24"
+                        className="h-5 w-5 xl:h-6 xl:w-6"
+                        fill="none"
+                        stroke="currentColor"
+                        strokeWidth="2"
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      >
+                        <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" />
+                        <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.88l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 .6 1.7 1.7 0 0 0-.4 1.1V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 8.6 19.4a1.7 1.7 0 0 0-1.88.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-.6-1 1.7 1.7 0 0 0-1.1-.4H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 8.6a1.7 1.7 0 0 0-.34-1.88l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-.6 1.7 1.7 0 0 0 .4-1.1V3a2 2 0 1 1 4 0v.09A1.7 1.7 0 0 0 15.4 4.6a1.7 1.7 0 0 0 1.88-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9c.2.38.55.7 1 .9.23.1.47.15.72.15H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51.95Z" />
+                      </svg>
+                    </button>
+                  </div>
+
+                  <div className="mt-3 hidden gap-4 border-t border-sky-900/40 pt-4 text-sm font-bold text-slate-300 md:grid md:grid-cols-3 xl:mt-7 xl:pt-6">
+                    <div className="flex items-center gap-3">
+                      <span className="text-blue-400">Quick rounds</span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className="text-blue-400">Learn as you play</span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className="text-blue-400">Track your progress</span>
+                    </div>
+                  </div>
+
+                  {!canStart && (
+                    <p className="mt-4 text-sm text-rose-300">
+                      Select at least four aircraft in Settings to start a quiz.
+                    </p>
+                  )}
+                </div>
               </div>
             </div>
           </div>
-          <p className="mt-3 text-xs text-slate-400">
-            Time per question is fixed at <strong>15s</strong>. Options per question is fixed at <strong>4</strong>.
-          </p>
-        </section>
 
-        <div className="flex flex-wrap items-center gap-3">
-          <button
-            onClick={onStart}
-            className="rounded-xl bg-sky-500 px-6 py-3 font-semibold text-slate-950 shadow hover:bg-sky-400"
-          >
-            Start quiz
-          </button>
-          <button
-            onClick={onLearn}
-            className="rounded-xl border border-slate-800 bg-slate-900 px-6 py-3 font-semibold hover:border-slate-700"
-          >
-            Learn mode
+          <div className="hidden space-y-4 xl:block xl:space-y-5">
+            <div className="flex min-h-[calc(100dvh-8rem)] flex-col justify-between">
+              <div>
+                <div className="rounded-3xl border border-sky-800/60 bg-slate-900/75 p-6 shadow-xl shadow-sky-950/20">
+                  <div className="mb-5 flex items-start justify-between gap-4">
+                    <div className="flex gap-4">
+                      <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-blue-600/20 text-blue-400">
+                        <svg aria-hidden="true" viewBox="0 0 24 24" className="h-7 w-7" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M9 11h6M9 15h6M9 7h2" />
+                          <path d="M7 3h10a2 2 0 0 1 2 2v15l-3-2-3 2-3-2-3 2V5a2 2 0 0 1 2-2Z" />
+                        </svg>
+                      </span>
+                      <div>
+                        <h3 className="text-xl font-black text-white">Spotting checklist</h3>
+                      <p className="mt-1 text-sm text-slate-400">
+                        Scan the image in this order before you answer.
+                      </p>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 gap-3">
+                    <ChecklistItem
+                      number="01"
+                      title="Silhouette"
+                      body="Wing sweep, fuselage length, nose shape, and tail style."
+                      icon={null}
+                      iconImageSrc="/app-icon.png"
+                    />
+                    <ChecklistItem
+                      number="02"
+                      title="Engines"
+                      body="Count them, then check whether they sit underwing, rear, or on pylons."
+                      icon={<><circle cx="12" cy="12" r="7" /><circle cx="12" cy="12" r="2" /><path d="M12 5v14M5 12h14M7.1 7.1l9.8 9.8M16.9 7.1l-9.8 9.8" /></>}
+                    />
+                    <ChecklistItem
+                      number="03"
+                      title="Details"
+                      body="Look for winglets, landing gear stance, canopy, props, and deck shape."
+                      icon={<><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z" /><path d="M19 12h3M2 12h3M12 2v3M12 19v3M4.9 4.9 7 7M17 17l2.1 2.1M19.1 4.9 17 7M7 17l-2.1 2.1" /></>}
+                    />
+                  </div>
+                </div>
+
+                <div className="mt-5 rounded-3xl border border-sky-800/60 bg-slate-900/75 p-6 shadow-xl shadow-sky-950/20">
+                  <div className="flex items-center gap-4">
+                    <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-blue-600/20 text-blue-400">
+                      <svg aria-hidden="true" viewBox="0 0 24 24" className="h-7 w-7" fill="currentColor">
+                        <path d="M12 2 14 9l7 3-7 3-2 7-2-7-7-3 7-3 2-7Z" />
+                      </svg>
+                    </span>
+                    <div>
+                      <h3 className="text-xl font-black text-white">Aircraft types</h3>
+                      <p className="mt-1 text-sm text-slate-400">
+                        Adjust the aircraft pool from Settings.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-4">
+                    {activeTypes.map((t) => (
+                      <span
+                        key={t}
+                        className="rounded-xl border border-sky-500/40 bg-blue-600/20 px-4 py-3 text-center text-sm font-black capitalize text-sky-100"
+                      >
+                        {t}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-5 rounded-3xl border border-sky-800/60 bg-[linear-gradient(135deg,rgba(6,182,212,0.18),rgba(15,23,42,0.65))] p-6 shadow-xl shadow-sky-950/20">
+                <div className="flex items-center gap-4">
+                  <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-emerald-500/20 text-emerald-300">
+                    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-7 w-7" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M9 18h6M10 22h4" />
+                      <path d="M8.5 14.5A6 6 0 1 1 15.5 14c-.8.7-1.5 1.5-1.5 2.5h-4c0-.9-.6-1.6-1.5-2Z" />
+                    </svg>
+                  </span>
+                  <div className="text-xl font-black text-white">Spotter tip</div>
+                </div>
+                <p className="mt-2 text-sm leading-6 text-slate-300">
+                  Start with wing shape, engine count, and tail layout. Model
+                  details get easier once the big silhouette is familiar.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function QuestionLoadingScreen({ status, message, onRetry, onQuit }: any) {
+  const failed = status === "error";
+  return (
+    <main className="mx-auto flex min-h-[calc(100dvh-4rem)] items-center justify-center px-4">
+      <div className="text-center">
+        {!failed ? (
+          <>
+            <div className="mx-auto h-6 w-6 animate-spin rounded-full border-2 border-slate-700 border-t-sky-400" aria-hidden="true" />
+            <p className="mt-3 text-sm text-slate-400">Loading image…</p>
+          </>
+        ) : (
+          <>
+            <p className="text-sm text-slate-300">Photo unavailable</p>
+            <p className="mt-1 text-xs text-slate-500">{message}</p>
+          </>
+        )}
+        <div className="mt-4 flex items-center justify-center gap-2">
+          {failed && (
+            <button onClick={onRetry} className="text-sm text-sky-400 hover:text-sky-300">
+              Retry
+            </button>
+          )}
+          <button onClick={onQuit} className="text-sm text-slate-500 hover:text-slate-300">
+            Quit
           </button>
         </div>
       </div>
-
-      <div className="rounded-2xl border border-slate-800 bg-gradient-to-br from-slate-900 to-slate-950 p-6">
-        <h2 className="mb-2 text-xl font-semibold">How it works</h2>
-        <ul className="list-disc space-y-2 pl-5 text-sm text-slate-300">
-          <li>We fetch a high‑quality image for a random aircraft model.</li>
-          <li>Pick the correct model from 4 shuffled options.</li>
-          <li>Answer fast for more points. Build streaks to unlock bonuses.</li>
-          <li>No exact photo repeats in the same session.</li>
-          <li>Browse the fleet in Learn Mode with filters & specs.</li>
-        </ul>
-        <div className="mt-6 rounded-xl border border-slate-800 bg-slate-900 p-4 text-xs text-slate-400">
-          Tip: You can switch the image source or plug another API by editing
-          <code> fetchImageForAircraft()</code>.
-        </div>
-      </div>
-    </div>
+    </main>
   );
 }
 
@@ -891,89 +1251,143 @@ function QuizScreen({
   totalTime,
   onAnswer,
   onNext,
+  onQuit,
   locked,
   feedback,
-  progressPct,
+  onImageError,
+  loading,
+  loadError,
+  onRetry,
 }: any) {
   const pct = Math.max(0, Math.min(100, Math.round((timeLeft / totalTime) * 100)));
 
   return (
-    <main className="mx-auto max-w-5xl px-4 py-6">
+    <main className="mx-auto flex h-[calc(100dvh-3.5rem)] w-full max-w-6xl flex-col overflow-hidden px-3 py-2 sm:px-5 sm:py-3 lg:px-8 lg:py-2">
       {/* Progress */}
-      <div className="mb-4">
-        <div className="mb-1 flex items-center justify-between text-xs text-slate-400">
-          <span>
-            Question {questionIndex + 1} / {totalQuestions}
+      <div className="mb-2 shrink-0 rounded-xl border border-sky-900/70 bg-slate-900/55 p-2.5 sm:mb-3 sm:rounded-2xl sm:p-3 lg:grid lg:grid-cols-[10rem_1fr_9rem] lg:items-center lg:gap-6 lg:px-5 lg:py-2">
+        <div className="mb-2 flex items-center justify-between gap-3 text-xs font-semibold text-slate-300 lg:mb-0">
+          <span className="sm:text-sm">
+            <span className="hidden text-slate-500 sm:inline">Question </span>{questionIndex + 1} <span className="text-slate-500">/ {totalQuestions}</span>
           </span>
-          <span>Time: {Math.ceil(timeLeft)}s</span>
+          <div className="flex items-center gap-2 lg:hidden">
+            <span className="font-bold text-white">{Math.ceil(timeLeft)}s</span>
+            <button
+              onClick={onQuit}
+              aria-label="Quit quiz"
+              title="Quit quiz"
+              className="inline-flex h-8 w-8 items-center justify-center rounded-lg border border-slate-700 bg-slate-950/70 text-slate-300 hover:border-rose-500/50 hover:text-rose-200"
+            >
+              <svg
+                aria-hidden="true"
+                viewBox="0 0 24 24"
+                className="h-4 w-4"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <path d="M10 7 5 12l5 5" />
+                <path d="M5 12h12" />
+                <path d="M14 4h5v16h-5" />
+              </svg>
+            </button>
+          </div>
         </div>
-        <div className="h-2 overflow-hidden rounded bg-slate-800">
+        <div className="h-2 overflow-hidden rounded-full bg-slate-800 sm:h-2.5">
           <div
-            className="h-full bg-sky-500 transition-[width] duration-200"
+            className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-blue-500 transition-[width] duration-200"
             style={{ width: `${pct}%` }}
           />
+        </div>
+        <div className="hidden items-center justify-end gap-3 lg:flex">
+          <span className="text-2xl font-black text-white">{Math.ceil(timeLeft)}s</span>
+          <button onClick={onQuit} aria-label="Quit quiz" className="inline-flex h-10 w-10 items-center justify-center rounded-xl border border-slate-700 bg-slate-950/70 text-slate-300 hover:text-rose-300">
+            <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2.2"><path d="M10 7 5 12l5 5"/><path d="M5 12h12"/><path d="M14 4h5v16h-5"/></svg>
+          </button>
         </div>
       </div>
 
       {/* Photo */}
-      <div className="relative aspect-video w-full overflow-hidden rounded-2xl border border-slate-800 bg-slate-900">
-        {current.imageUrl ? (
-          // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={current.imageUrl}
-            alt={current.correct?.model}
-            className={classNames(
-              "h-full w-full object-cover transition-opacity duration-500",
-              locked ? "opacity-60" : "opacity-100"
-            )}
-          />
-        ) : (
-          <div className="flex h-full w-full items-center justify-center text-slate-400">
-            Loading image…
+      <div className="relative min-h-[7rem] w-full flex-1 overflow-hidden rounded-2xl border border-sky-900/70 bg-slate-900 shadow-2xl shadow-black/30 lg:rounded-3xl">
+        {current?.imageUrl && !loading ? (
+          <>
+            <img
+              src={current.imageUrl}
+              alt=""
+              aria-hidden="true"
+              className="absolute inset-0 h-full w-full scale-[1.15] object-cover opacity-90 blur-lg"
+            />
+            <img
+              src={current.imageUrl}
+              alt={current.correct?.model}
+              onError={onImageError}
+              className={classNames(
+                "aircraft-image-foreground relative z-[1] h-full w-full object-contain transition-opacity duration-500",
+                locked ? "opacity-80" : "opacity-100"
+              )}
+            />
+          </>
+        ) : loadError ? (
+          <div className="flex h-full w-full flex-col items-center justify-center gap-2 bg-slate-900 text-center">
+            <span className="text-sm text-slate-400">Photo unavailable</span>
+            <button onClick={onRetry} className="text-sm text-sky-400 hover:text-sky-300">Retry</button>
           </div>
+        ) : (
+          <div className="aircraft-image-skeleton h-full w-full" aria-label="Loading aircraft image" />
         )}
         <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(transparent,rgba(2,6,23,0.6))]" />
       </div>
 
       {/* Options */}
-      <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
-        {current.options.map((a: Aircraft) => (
+      <div className="mt-2 grid shrink-0 grid-cols-1 gap-1.5 sm:mt-3 sm:gap-2 lg:mt-2 lg:gap-1.5">
+        {(current?.options || []).map((a: Aircraft, index: number) => {
+          const isCorrectAnswer = locked && current?.correct && a.id === current.correct.id;
+          const isWrongSelection = locked && feedback?.selectedId === a.id && !isCorrectAnswer;
+          return (
           <button
             key={a.id}
-            disabled={locked}
+            disabled={locked || loading}
             onClick={() => onAnswer(a)}
             className={classNames(
-              "rounded-xl border px-4 py-3 text-left text-sm font-medium transition",
-              "border-slate-800 bg-slate-900 hover:border-sky-600/40 hover:bg-slate-900/80",
-              locked && a.id === current.correct.id &&
-                "border-emerald-500/60 bg-emerald-500/10"
+              "group flex min-h-10 w-full items-center gap-3 rounded-xl border px-3 py-2 text-left text-sm font-bold transition sm:min-h-12 sm:rounded-2xl sm:px-5 sm:py-2.5 sm:text-base lg:min-h-10 lg:py-1.5",
+              "border-slate-700/80 bg-slate-900/80 hover:border-sky-500/60 hover:bg-slate-800/90 disabled:cursor-default",
+              isCorrectAnswer && "border-emerald-500 bg-emerald-500/10 text-emerald-50",
+              isWrongSelection && "border-rose-500 bg-rose-500/10 text-rose-50"
             )}
           >
-            {a.model}
+            <span className={classNames(
+              "flex h-7 w-7 shrink-0 items-center justify-center rounded-full border border-sky-500/80 text-xs font-black text-sky-400 sm:h-9 sm:w-9 sm:text-sm",
+              isCorrectAnswer && "border-emerald-400 bg-emerald-500 text-white",
+              isWrongSelection && "border-rose-400 bg-rose-500 text-white"
+            )}>{String.fromCharCode(65 + index)}</span>
+            <span className="min-w-0 flex-1">{a.model}</span>
+            {isCorrectAnswer && <span className="text-lg text-emerald-400" aria-label="Correct">✓</span>}
+            {isWrongSelection && <span className="text-lg text-rose-400" aria-label="Incorrect">×</span>}
           </button>
-        ))}
+        )})}
       </div>
 
       {/* Feedback */}
       {feedback && !feedback.correct && (
         <div
           className={classNames(
-            "mt-4 rounded-xl border p-4",
-            "border-rose-600/40 bg-rose-500/10"
+            "mt-2 shrink-0 rounded-2xl border p-3 sm:mt-3 sm:p-4 lg:mt-2 lg:p-3",
+            "border-rose-500/60 bg-rose-950/30 shadow-lg shadow-rose-950/20"
           )}
         >
-          <div className="flex items-center justify-between">
-            <div>
-              <div className="text-sm font-semibold">Not quite.</div>
+          <div className="flex items-center justify-between gap-4">
+            <div className="min-w-0">
+              <div className="font-black text-rose-400">Incorrect</div>
               <div className="mt-1 text-sm text-slate-200">
-                Answer: <span className="font-medium">{feedback.correctModel}</span>
+                Answer: <span className="font-bold text-sky-400">{feedback.correctModel}</span>
               </div>
-              <p className="mt-2 text-sm text-slate-300">{feedback.fact}</p>
+              <p className="mt-1 line-clamp-2 text-xs leading-4 text-slate-300 sm:text-sm sm:leading-5">{feedback.fact}</p>
             </div>
             <div>
               <button
                 onClick={onNext}
-                className="rounded-lg bg-sky-500 px-4 py-2 font-semibold text-slate-950 hover:bg-sky-400"
+                className="rounded-xl bg-sky-500 px-4 py-2.5 text-sm font-black text-slate-950 hover:bg-sky-400 sm:px-6"
               >
                 Next
               </button>
@@ -983,7 +1397,7 @@ function QuizScreen({
       )}
 
       {feedback && feedback.correct && (
-        <div className="mt-4 flex items-center justify-between rounded-lg border border-emerald-600/40 bg-emerald-500/10 p-3">
+        <div className="mt-2 flex shrink-0 items-center justify-between rounded-2xl border border-emerald-500/50 bg-emerald-500/10 p-3 sm:mt-3 sm:p-4 lg:mt-2 lg:p-3">
           <div className="text-sm font-semibold">
             Correct!
             <span className="ml-2 text-slate-300">
@@ -992,35 +1406,26 @@ function QuizScreen({
           </div>
           <button
             onClick={onNext}
-            className="rounded-md bg-sky-500 px-3 py-1.5 text-sm font-semibold text-slate-950 hover:bg-sky-400"
+            className="rounded-xl bg-sky-500 px-4 py-2.5 text-sm font-black text-slate-950 hover:bg-sky-400"
           >
             Next
           </button>
         </div>
       )}
 
-      {/* Round Progress */}
-      <div className="mt-6">
-        <div className="h-1 overflow-hidden rounded bg-slate-800">
-          <div
-            className="h-full bg-sky-600 transition-[width] duration-300"
-            style={{ width: `${progressPct}%` }}
-          />
-        </div>
-      </div>
     </main>
   );
 }
 
 function ResultScreen({ score, bestStreak, onPlayAgain, onBackToMenu }: any) {
   return (
-    <main className="mx-auto max-w-3xl px-4 py-12">
-      <div className="rounded-2xl border border-slate-800 bg-slate-900/40 p-8 text-center">
-        <h2 className="text-2xl font-bold">Flight complete ✈️</h2>
+    <main className="mx-auto flex min-h-[calc(100dvh-4rem)] max-w-3xl items-center justify-center px-4 py-4">
+      <div className="w-full rounded-2xl border border-slate-800 bg-slate-900/40 p-6 text-center sm:p-8">
+        <h2 className="text-2xl font-bold sm:text-3xl">Flight complete</h2>
         <p className="mt-2 text-slate-300">Final score</p>
-        <div className="mt-2 text-5xl font-extrabold text-sky-400">{score}</div>
+        <div className="mt-2 text-5xl font-extrabold text-sky-400 sm:text-6xl">{score}</div>
         <div className="mt-3 text-sm text-slate-300">Best streak: {bestStreak} in a row</div>
-        <div className="mt-6 flex items-center justify-center gap-3">
+        <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
           <button
             onClick={onPlayAgain}
             className="rounded-xl bg-sky-500 px-6 py-3 font-semibold text-slate-950 hover:bg-sky-400"
@@ -1039,12 +1444,134 @@ function ResultScreen({ score, bestStreak, onPlayAgain, onBackToMenu }: any) {
   );
 }
 
-function LeaderboardModal({ leaderboard, onClose, onReset }: any) {
+function SettingsModal({ enabledTypes, setEnabledTypes, onClose }: any) {
+  const selectedCount = TYPES.filter((t) => enabledTypes[t]).length;
+
+  return (
+    <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/70 p-4">
+      <div className="w-full max-w-lg rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl shadow-black/40">
+        <div className="mb-5 flex items-start justify-between gap-4">
+          <div>
+            <h3 className="text-lg font-bold">Settings</h3>
+            <p className="mt-1 text-sm text-slate-400">
+              Choose which aircraft types appear in quiz rounds.
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            className="rounded-md border border-slate-700 px-3 py-1 text-sm hover:bg-slate-800"
+          >
+            Close
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {TYPES.map((t) => (
+            <label
+              key={t}
+              className={classNames(
+                "flex cursor-pointer items-center justify-between rounded-xl border p-4 text-sm transition",
+                enabledTypes[t]
+                  ? "border-sky-500/40 bg-sky-500/10"
+                  : "border-slate-800 bg-slate-950/60 hover:border-slate-700"
+              )}
+            >
+              <span className="font-semibold capitalize">{t}</span>
+              <input
+                type="checkbox"
+                className="h-4 w-4 accent-sky-400"
+                checked={enabledTypes[t]}
+                onChange={(e) =>
+                  setEnabledTypes((s: Record<string, boolean>) => ({
+                    ...s,
+                    [t]: e.target.checked,
+                  }))
+                }
+              />
+            </label>
+          ))}
+        </div>
+
+        <div className="mt-5 rounded-xl border border-slate-800 bg-slate-950/70 p-4 text-sm text-slate-300">
+          <div className="font-semibold text-white">Round format</div>
+          <p className="mt-1 text-slate-400">
+            10 questions, 15 seconds each, 4 choices per question.
+          </p>
+          {selectedCount === 0 && (
+            <p className="mt-3 text-rose-300">
+              Select at least one type to build an aircraft pool.
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ConfirmQuitModal({
+  onCancel,
+  onConfirm,
+}: {
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4">
+      <div className="w-full max-w-sm rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl shadow-black/40">
+        <div className="flex items-start gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-rose-500/15 text-rose-300">
+            <svg
+              aria-hidden="true"
+              viewBox="0 0 24 24"
+              className="h-5 w-5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M12 9v4" />
+              <path d="M12 17h.01" />
+              <path d="M10.3 3.9 2.7 18a2 2 0 0 0 1.8 3h15a2 2 0 0 0 1.8-3L13.7 3.9a2 2 0 0 0-3.4 0Z" />
+            </svg>
+          </div>
+          <div>
+            <h3 className="text-lg font-bold text-white">Quit this quiz?</h3>
+            <p className="mt-1 text-sm leading-6 text-slate-300">
+              Your current round progress will be lost.
+            </p>
+          </div>
+        </div>
+        <div className="mt-5 flex items-center justify-end gap-2">
+          <button
+            onClick={onCancel}
+            className="rounded-lg border border-slate-700 px-4 py-2 text-sm font-semibold text-slate-100 hover:bg-slate-800"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            className="rounded-lg bg-rose-500 px-4 py-2 text-sm font-bold text-white hover:bg-rose-400"
+          >
+            Quit
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LeaderboardModal({ leaderboard, online, onClose, onReset }: any) {
   return (
     <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/60 p-4">
       <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-6">
         <div className="mb-4 flex items-center justify-between">
-          <h3 className="text-lg font-semibold">Local leaderboard</h3>
+          <div>
+            <h3 className="text-lg font-semibold">Global leaderboard</h3>
+            <p className={classNames("mt-0.5 text-xs", online ? "text-emerald-400" : "text-amber-400")}>
+              {online ? "Live worldwide scores" : "Offline — showing scores saved on this device"}
+            </p>
+          </div>
           <button
             onClick={onClose}
             className="rounded-md border border-slate-700 px-3 py-1 text-sm hover:bg-slate-800"
@@ -1075,7 +1602,7 @@ function LeaderboardModal({ leaderboard, onClose, onReset }: any) {
             onClick={onReset}
             className="text-xs text-slate-400 underline decoration-dotted underline-offset-4 hover:text-slate-200"
           >
-            Reset leaderboard
+            Clear offline scores
           </button>
         </div>
       </div>
@@ -1089,13 +1616,24 @@ function NamePrompt({ defaultName, onSave, onCancel }: any) {
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4">
       <div className="w-full max-w-sm rounded-2xl border border-slate-800 bg-slate-900 p-6">
         <h3 className="text-lg font-semibold">New high score!</h3>
-        <p className="mt-1 text-sm text-slate-300">Add your name to the leaderboard.</p>
-        <input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          className="mt-3 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-sky-500"
-          maxLength={24}
-        />
+        <p className="mt-1 text-sm text-slate-300">Use your suggested callsign or choose your own.</p>
+        <div className="mt-3 flex gap-2">
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-sky-500"
+            maxLength={24}
+          />
+          <button
+            type="button"
+            onClick={() => setName(generateCallsign())}
+            title="Suggest another callsign"
+            aria-label="Suggest another callsign"
+            className="rounded-lg border border-slate-700 px-3 text-sky-400 hover:border-sky-500"
+          >
+            ↻
+          </button>
+        </div>
         <div className="mt-4 flex items-center justify-end gap-2">
           <button
             onClick={onCancel}
@@ -1115,7 +1653,7 @@ function NamePrompt({ defaultName, onSave, onCancel }: any) {
   );
 }
 
-function LearnModeScreen({ db, enabledTypes, setEnabledTypes }: any) {
+function LearnModeScreen({ db, enabledTypes, setEnabledTypes, onBackToMenu }: any) {
   const [q, setQ] = useState("");
   const enabled = new Set(
     TYPES.filter((t) => enabledTypes[t]).map((t) => t as string)
@@ -1132,7 +1670,28 @@ function LearnModeScreen({ db, enabledTypes, setEnabledTypes }: any) {
   return (
     <main className="mx-auto max-w-6xl px-4 py-6">
       <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-xl font-semibold">Learn mode</h2>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={onBackToMenu}
+            aria-label="Back to menu"
+            title="Back to menu"
+            className="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-slate-800 bg-slate-900 text-slate-100 hover:border-sky-500/50"
+          >
+            <svg
+              aria-hidden="true"
+              viewBox="0 0 24 24"
+              className="h-5 w-5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M15 18 9 12l6-6" />
+            </svg>
+          </button>
+          <h2 className="text-xl font-semibold">Learn mode</h2>
+        </div>
         <div className="flex items-center gap-2 text-xs">
           {TYPES.map((t) => (
             <label
@@ -1157,7 +1716,7 @@ function LearnModeScreen({ db, enabledTypes, setEnabledTypes }: any) {
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder="Search models or roles…"
+          placeholder="Search models or roles..."
           className="w-full rounded-xl border border-slate-800 bg-slate-900 px-4 py-3 text-sm outline-none focus:border-sky-500"
         />
       </div>
@@ -1174,6 +1733,9 @@ function LearnModeScreen({ db, enabledTypes, setEnabledTypes }: any) {
 function LearnCard({ a }: { a: Aircraft }) {
   const [img, setImg] = useState<string | null>(null);
   const mounted = useRef(false);
+  const wikipediaUrl = `https://en.wikipedia.org/wiki/${encodeURIComponent(
+    (a.wikiTitle || a.model).replaceAll(" ", "_")
+  )}`;
 
   useEffect(() => {
     mounted.current = true;
@@ -1187,14 +1749,15 @@ function LearnCard({ a }: { a: Aircraft }) {
   }, [a.id]);
 
   return (
-    <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-900">
+    <div className="flex overflow-hidden rounded-2xl border border-slate-800 bg-slate-900">
+      <div className="flex w-full flex-col">
       <div className="relative aspect-video w-full">
         {img ? (
           // eslint-disable-next-line @next/next/no-img-element
           <img src={img} alt={a.model} className="h-full w-full object-cover" />
         ) : (
           <div className="flex h-full w-full items-center justify-center text-slate-400">
-            Loading…
+            Loading...
           </div>
         )}
         <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-slate-950/70 via-transparent to-transparent" />
@@ -1202,10 +1765,20 @@ function LearnCard({ a }: { a: Aircraft }) {
           {a.type}
         </div>
       </div>
-      <div className="p-4">
+      <div className="flex flex-1 flex-col p-4">
         <div className="text-sm font-semibold">{a.model}</div>
         <div className="mt-1 text-xs text-slate-300">{a.specs.role}</div>
         <p className="mt-2 text-sm text-slate-300">{a.fact}</p>
+        <a
+          href={wikipediaUrl}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="mt-4 inline-flex items-center gap-1.5 self-start text-sm font-semibold text-sky-400 hover:text-sky-300"
+        >
+          Read more on Wikipedia
+          <span aria-hidden="true">↗</span>
+        </a>
+      </div>
       </div>
     </div>
   );
@@ -1217,15 +1790,6 @@ function LearnCard({ a }: { a: Aircraft }) {
 function isTopScore(score: number, board: Array<{ score: number }>) {
   if (board.length < 10) return true;
   return score > board[board.length - 1].score;
-}
-
-function defaultPlayerName() {
-  try {
-    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-    return `Pilot@${tz.split("/").pop()}`;
-  } catch {
-    return "Pilot";
-  }
 }
 
 // --------------------------
@@ -1270,3 +1834,5 @@ function defaultPlayerName() {
     // no-op in production
   }
 })();
+
+
