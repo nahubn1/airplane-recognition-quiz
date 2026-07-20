@@ -1,235 +1,155 @@
 # Airplane Spotter
 
-A minimalist, aviation-themed quiz that tests aircraft recognition skills. Each round shows a full-screen airplane photo and 4 multiple-choice options. Beat the clock, build streaks, and climb the local leaderboard. Includes a Learn Mode for browsing models with images and specs.
+Airplane Spotter is a fast, responsive aircraft-recognition quiz. Identify aircraft from real photos, learn the visual details that distinguish them, and compare your best score on a global leaderboard.
 
----
+**Live app:** [airplane-recognition-quiz.pages.dev](https://airplane-recognition-quiz.pages.dev/)
 
-## Live Demo
+## Highlights
 
-* **Production**: https://airplane-recognition-quiz.vercel.app/
+- 10-question rounds with 15 seconds and four choices per question.
+- More than 140 commercial, military, vintage, and general-aviation aircraft.
+- Speed and streak bonuses with immediate answer feedback.
+- A responsive interface designed for desktop, tablet, and mobile screens.
+- Learn Mode with filtering, aircraft facts, specifications, and Wikipedia links.
+- A global leaderboard backed by Cloudflare D1, with an offline browser fallback.
+- No registration or login required.
 
----
+## Image loading
 
-## Features
+Aircraft photos are resolved from Wikipedia and Wikimedia Commons. The app starts warming five images while the player is still on the menu and continues preloading upcoming images during a round.
 
-### Gameplay
+The timer begins only after the current image has downloaded and decoded. A pulsing skeleton is displayed while loading, so a slow connection never consumes the player's answer time. Successful image URLs and decoded images are cached to reduce repeat downloads.
 
-* **High-quality photo** pulled per question (Wikipedia REST APIs with caching + robust fallbacks).
-* **Exactly 4 options** (1 correct + 3 plausible distractors).
-* **Immediate feedback**:
+## Anonymous player profiles
 
-  * Correct → compact success bar with points.
-  * Incorrect or timeout → a **card** shows the correct model + a short fact.
-* **Timer**: fixed **15s** per question (not user-changeable).
-* **Scoring**:
+On first use, the browser receives:
 
-  * Base **100 pts** for a correct answer.
-  * **Speed bonus**: proportional to time remaining.
-  * **Streak bonus**: +20 per consecutive correct answer.
-* **No photo repeats** within a session.
+- A random device identifier stored locally.
+- A generated callsign such as `Kestrel482` or `Aurora731`.
 
-### Engagement
+The profile is reused automatically after every quiz. Players are not asked to enter a username after each round; they can rename themselves from Settings whenever they want.
 
-* **Global leaderboard** backed by Cloudflare D1, with a browser `localStorage` offline fallback.
-* **Streak counter** + bonus points.
-* **Progress bars** for time and round progress.
+The server stores one best score per browser identity. Clearing site storage, using private browsing, or switching devices creates a new anonymous identity.
 
-### Replayability
+## Scoring
 
-* Randomized photo selection and answer order each question.
-* Option to set the **number of questions per round** (slider).
+For every correct answer:
 
-### Learn Mode
+```text
+100 + round((time remaining / 15) * 100) + (current streak * 20)
+```
 
-* Browse aircraft with images, type filters (commercial, military, vintage, general), quick search, and short facts/specs.
+Incorrect answers and timeouts award no points and reset the streak.
 
-### Visuals & UX
+## Technology
 
-* Minimalist UI, responsive full-bleed images.
-* Smooth transitions, clean typography, dark theme.
+- React 18 and TypeScript
+- Vite
+- Tailwind CSS
+- Cloudflare Pages Functions
+- Cloudflare D1
+- Wikipedia and Wikimedia Commons APIs
+- Browser `localStorage` for profiles, image URLs, completion state, and offline scores
 
----
+## Run locally
 
-## Tech Stack
+Requirements:
 
-* **React 18** + **TypeScript**
-* **Vite**
-* **Tailwind CSS**
-* Image source: **Wikipedia API** (REST Summary + Media List + PageImages fallback)
-* Storage: **localStorage** (leaderboard + image URL cache)
-
----
-
-## Quick Start (Local)
-
-**Prereqs**
-
-* Node.js 18+ (LTS recommended)
-* npm 9+ or pnpm/yarn
+- Node.js 18 or newer
+- npm
 
 ```bash
-# Install
 npm install
-
-# Start dev server
 npm run dev
+```
 
-# Build for production
+Open the URL printed by Vite, normally [http://127.0.0.1:5173](http://127.0.0.1:5173).
+
+Create a production build with:
+
+```bash
 npm run build
 npm run preview
 ```
 
-Open the dev URL (shown in your terminal), usually `http://localhost:5173`.
+When running through Vite alone, the quiz works normally and the leaderboard uses its offline fallback because Cloudflare Pages Functions are not present in the Vite server.
 
----
+## Deploy to Cloudflare Pages
 
-## Deploy (Vercel)
+The repository includes the Pages Functions, D1 migration, and `wrangler.jsonc` configuration required for the global leaderboard.
 
-1. Push this repo to **GitHub**.
-2. Go to **Vercel → New Project → Import Git Repository**.
-3. Framework Preset: **Vite**
-   Build Command: `npm run build`
-   Output Directory: `dist`
-4. Deploy.
-5. Replace the **Live Demo** link above with your Vercel domain.
+### 1. Create the database
 
-> Any future push to `main` will auto-deploy.
-
-## Free Deployment with a Global Leaderboard (Cloudflare)
-
-This project includes Cloudflare Pages Functions and a D1 migration for the
-global leaderboard.
-
-Create the D1 database from **Workers & Pages > D1 SQL Database** in the
-Cloudflare dashboard. Open its SQL console and paste the contents of
-`migrations/0001_global_leaderboard.sql`, then execute it.
-
-Deploy by importing the GitHub repository into Cloudflare Pages with
-`npm run build` as the build command and `dist` as the output directory.
-In the Pages project settings, add a D1 binding named exactly `DB` and select
-the leaderboard database. The frontend automatically uses `/api/leaderboard`
-and `/api/scores` in production, while retaining the local leaderboard as an
-offline fallback.
-
----
-
-## Project Structure
-
+```bash
+npx wrangler d1 create airplane-quiz-leaderboard
 ```
+
+Copy the returned database ID into the `d1_databases` entry in `wrangler.jsonc`. Keep the binding name exactly `DB`.
+
+### 2. Apply the schema
+
+```bash
+npx wrangler d1 migrations apply airplane-quiz-leaderboard --remote
+```
+
+On a corporate network that installs its own trusted certificate, Wrangler may need Windows' system certificate store:
+
+```powershell
+$env:NODE_USE_SYSTEM_CA='1'
+npx wrangler d1 migrations apply airplane-quiz-leaderboard --remote
+```
+
+Do not disable TLS verification.
+
+### 3. Create a Pages project
+
+In Cloudflare, select **Workers & Pages → Create application → Pages → Import an existing Git repository** and use:
+
+- Root directory: `/`
+- Build command: `npm run build`
+- Build output directory: `dist`
+- Production branch: `main`
+
+A Pages Git deployment does not need a custom deploy command. If the setup requires `npx wrangler deploy`, it is the Workers Builds workflow rather than the Pages workflow used by this project.
+
+### 4. Confirm the D1 binding
+
+In the Pages project, open **Settings → Bindings** and connect the D1 database using the variable name `DB`. Redeploy after adding or changing a binding.
+
+Every subsequent push to `main` will trigger a new production deployment.
+
+## API routes
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/leaderboard` | Returns the ten highest scores. |
+| `POST` | `/api/scores` | Creates or updates an anonymous profile and its best score. |
+
+Usernames accept 3–24 letters, numbers, underscores, or hyphens. A username cannot belong to more than one anonymous device identity.
+
+## Project structure
+
+```text
 .
-├─ index.html
-├─ package.json
-├─ postcss.config.js
-├─ tailwind.config.js
-├─ tsconfig.json
-├─ vite.config.ts
-└─ src/
-   ├─ main.tsx
-   ├─ index.css
-   └─ App.tsx        # The full quiz app lives here
+├── assets/                 Source design assets
+├── functions/api/         Cloudflare Pages API routes
+├── migrations/            D1 database migrations
+├── public/                 Public app assets
+├── src/
+│   ├── App.tsx             Quiz UI and application logic
+│   ├── aircraftData.ts     Aircraft catalogue
+│   ├── index.css           Global and responsive styles
+│   └── main.tsx            React entry point
+├── index.html
+├── package.json
+├── vite.config.ts
+└── wrangler.jsonc
 ```
 
----
+## Image attribution
 
-## Configuration Notes
-
-* **Timer** is fixed at **15 seconds** (by design).
-* **Options per question**: always **4**.
-* **Questions per round**: adjustable on the menu screen.
-* **Image fetching**:
-
-  * Tries multiple Wikipedia endpoints in this order:
-
-    1. REST **Summary** (`originalimage`/`thumbnail`)
-    2. REST **Media List** (first image)
-    3. Action API **PageImages** (fallback)
-  * If no image is found, the app generates a **clean SVG poster** with the model name.
-  * Successful URLs are cached (in-memory + `localStorage`) for speed.
-* **No exact photo repeats** in the same session (best-effort, with fallback attempts).
-
----
-
-## Scoring Details
-
-* **Correct** = 100 + `round((timeLeft / 15s) * 100)` + `streak * 20`
-* **Incorrect/Timeout** = 0 points; streak resets.
-* Feedback card shows the correct answer and a short fact when you miss it.
-
----
-
-## Leaderboard
-
-* Stored locally in `localStorage` (key: `airquiz_leaderboard_v1`).
-* Keeps top 10 scores by default.
-* (Optional future: Switch to a hosted DB like Supabase for global boards.)
-
----
-
-## Learn Mode
-
-* Filter by **type** (commercial, military, vintage, general).
-* Quick search by model or role.
-* Displays image, role, and a short fact for each aircraft.
-
----
-
-## Attribution & Licensing of Images
-
-* Photos are fetched from **Wikipedia/Wikimedia** at runtime.
-* Images on Wikipedia are contributed under various licenses (often **CC BY-SA**).
-* This app does not redistribute images; it displays them directly from Wikipedia.
-* If you publish screenshots or reuse images, ensure proper **attribution** per the source page’s license.
-
----
-
-## Troubleshooting
-
-* **Images not loading**
-
-  * Network fluke: try again or check the console.
-  * Clear cache: in DevTools → Application → Local Storage → remove keys like `wikiimg:*`.
-  * Wikipedia throttling: temporary; the SVG fallback ensures the app still works.
-
-* **Vercel build fails**
-
-  * Ensure Node version is recent on Vercel (defaults are fine for Vite).
-  * Confirm `Build Command` is `npm run build` and `Output Directory` is `dist`.
-
----
-
-## Development Notes / Internals
-
-* Exactly **4** options enforced with `slice(0, OPTIONS_PER_QUESTION - 1)`.
-* Timer: `useCountdown` hook restarts on question key change; locks on answer or timeout.
-* Session de-dupe for **models** and **photos** using `Set` refs.
-* Dev sanity checks via `console.assert` (non-blocking) to catch regressions.
-
----
-
-## Roadmap (nice-to-haves)
-
-* Keyboard shortcuts: **1–4** to answer, **N** for next.
-* Global leaderboard via Supabase/Firebase (with RLS).
-* Sound effects + subtle haptics (mobile).
-* Per-type difficulty and adaptive scoring.
-* Offline “internal dataset” image source.
-
----
+Photos are loaded at runtime from Wikipedia and Wikimedia Commons. Individual images may use different licenses, commonly Creative Commons licenses. Follow the source page's attribution and reuse requirements when redistributing an image or publishing it outside the app.
 
 ## Contributing
 
-PRs welcome! For significant changes, please open an issue to discuss your proposal first. Keep the **15s timer** and **4 options** constraints unless we make them configurable behind a flag.
-
----
-
-## License
-
-Choose a license that fits your needs (e.g., **MIT**).
-*Add a `LICENSE` file to the repo when decided.*
-
----
-
-## Acknowledgements
-
-* Wikipedia & Wikimedia contributors (images & data).
-* Aircraft communities and enthusiasts worldwide.
+Issues and pull requests are welcome. Please keep the core round format—10 questions, 15 seconds, and four answer choices—consistent unless the change intentionally redesigns the game.

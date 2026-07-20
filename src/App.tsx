@@ -37,18 +37,33 @@ const IMAGE_WARM_QUEUE_SIZE = 5;
 const PLAYER_PROFILE_KEY = "airquiz_player_v1";
 const LOCAL_LEADERBOARD_KEY = "airquiz_leaderboard_v1";
 
-type LeaderboardEntry = { name: string; score: number; date: string };
+type LeaderboardEntry = { name: string; score: number; date: string; deviceId?: string };
 type AnonymousProfile = { deviceId: string; username: string };
 
-const CALLSIGN_SUFFIXES = [
-  "Falcon", "Comet", "Raptor", "Voyager", "Harrier", "Condor",
-  "Meteor", "Skylark", "Phantom", "Nomad", "Osprey", "Viper",
+const CALLSIGN_BASES = [
+  "Ace", "Albatross", "Arrow", "Atlas", "Aurora", "Badger", "Beacon", "Bear",
+  "Bluebird", "Bolt", "Breeze", "Buzzard", "Canyon", "Cardinal", "Cedar", "Cheetah",
+  "Cirrus", "Cobra", "Comet", "Condor", "Corsair", "Cougar", "Crane", "Cricket",
+  "Cyclone", "Dagger", "Dawn", "Delta", "Dragon", "Eagle", "Echo", "Ember",
+  "Falcon", "Firefly", "Fox", "Ghost", "Glider", "Hawk", "Heron", "Horizon",
+  "Hornet", "Hunter", "Ibis", "Jet", "Kestrel", "Kite", "Lance", "Lark",
+  "Lightning", "Lynx", "Mako", "Merlin", "Meteor", "Mirage", "Mustang", "Nomad",
+  "Nova", "Orion", "Osprey", "Otter", "Owl", "Panther", "Pegasus", "Phantom",
+  "Phoenix", "Piper", "Polar", "Puma", "Quasar", "Raven", "Raptor", "Rocket",
+  "Sabre", "Scout", "Shadow", "Shark", "Sierra", "Skyhawk", "Skylark", "Sparrow",
+  "Specter", "Spirit", "Starling", "Storm", "Swift", "Talon", "Tempest", "Tiger",
+  "Titan", "Tornado", "Trident", "Turbo", "Viper", "Voyager", "Vulcan", "Wasp",
+  "Wildcat", "Wolf", "Zephyr",
 ];
 
 function generateCallsign() {
-  const suffix = choice(CALLSIGN_SUFFIXES);
+  const suffix = choice(CALLSIGN_BASES);
   const number = String(100 + randInt(900));
   return `${suffix}${number}`;
+}
+
+function normalizeUsername(username: string) {
+  return username.trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 24);
 }
 
 function getAnonymousProfile(): AnonymousProfile {
@@ -443,7 +458,9 @@ export default function AirplaneQuizApp() {
     }
   });
   const [leaderboardOnline, setLeaderboardOnline] = useState(false);
-  const [askName, setAskName] = useState<string | null>(null);
+  const [playerProfile, setPlayerProfile] = useState<AnonymousProfile>(() =>
+    getAnonymousProfile()
+  );
 
   async function refreshGlobalLeaderboard() {
     try {
@@ -609,11 +626,10 @@ export default function AirplaneQuizApp() {
     setLocked(true);
     const nextIdx = questionIndex + 1;
     if (nextIdx >= questionsPerRun) {
-      // End of run -> save leaderboard
-      const maybeTop = isTopScore(score, leaderboard);
+      // The browser's existing anonymous profile owns every score automatically.
       setHasCompletedQuiz(true);
       localStorage.setItem(QUIZ_COMPLETED_KEY, "true");
-      if (maybeTop) setAskName(getAnonymousProfile().username);
+      void saveLeaderboard();
       setScreen("result");
       return;
     }
@@ -632,15 +648,23 @@ export default function AirplaneQuizApp() {
     );
   }
 
-  async function saveLeaderboard(name: string) {
-    const cleanName = name.trim().replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 24) || generateCallsign();
-    let profile = saveAnonymousUsername(cleanName);
+  async function saveLeaderboard() {
+    let profile = playerProfile;
+    const previousBest = leaderboard.find(
+      (entry) => entry.deviceId === profile.deviceId || entry.name === profile.username
+    )?.score || 0;
     const entry = {
       name: profile.username,
-      score,
+      score: Math.max(score, previousBest),
       date: new Date().toISOString(),
+      deviceId: profile.deviceId,
     };
-    const updated = [...leaderboard, entry]
+    const updated = [
+      ...leaderboard.filter(
+        (item) => item.deviceId !== profile.deviceId && item.name !== profile.username
+      ),
+      entry,
+    ]
       .sort((a, b) => b.score - a.score)
       .slice(0, 10);
     setLeaderboard(updated);
@@ -659,15 +683,75 @@ export default function AirplaneQuizApp() {
 
     try {
       let response = await submit();
-      if (response.status === 409) {
+      // A generated name can rarely collide with another browser. Resolve that
+      // silently while keeping this browser's device identity unchanged.
+      for (let attempt = 0; response.status === 409 && attempt < 3; attempt += 1) {
         profile = saveAnonymousUsername(generateCallsign());
+        setPlayerProfile(profile);
         response = await submit();
       }
       if (!response.ok) throw new Error("Score submission failed");
+      if (profile.username !== entry.name) {
+        const corrected = updated.map((item) =>
+          item.deviceId === profile.deviceId ? { ...item, name: profile.username } : item
+        );
+        setLeaderboard(corrected);
+        localStorage.setItem(LOCAL_LEADERBOARD_KEY, JSON.stringify(corrected));
+      }
       await refreshGlobalLeaderboard();
     } catch {
       setLeaderboardOnline(false);
     }
+  }
+
+  async function updatePlayerUsername(rawName: string) {
+    const cleanName = normalizeUsername(rawName);
+    if (cleanName.length < 3) {
+      return { ok: false, error: "Use at least 3 letters or numbers." };
+    }
+    if (cleanName === playerProfile.username) return { ok: true, online: leaderboardOnline };
+
+    const previousName = playerProfile.username;
+    const candidate = { ...playerProfile, username: cleanName };
+    const persistRenamedProfile = () => {
+      const saved = saveAnonymousUsername(cleanName);
+      setPlayerProfile(saved);
+      setLeaderboard((current) => {
+        const renamed = current.map((entry) =>
+          entry.deviceId === saved.deviceId || entry.name === previousName
+            ? { ...entry, name: cleanName, deviceId: saved.deviceId }
+            : entry
+        );
+        localStorage.setItem(LOCAL_LEADERBOARD_KEY, JSON.stringify(renamed));
+        return renamed;
+      });
+      return saved;
+    };
+
+    try {
+      const response = await fetch("/api/scores", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({
+          name: candidate.username,
+          score,
+          bestStreak,
+          deviceId: candidate.deviceId,
+        }),
+      });
+      if (response.status === 409) {
+        return { ok: false, error: "That username is already in use." };
+      }
+      if (!response.ok) throw new Error("Profile update failed");
+    } catch {
+      persistRenamedProfile();
+      setLeaderboardOnline(false);
+      return { ok: true, online: false };
+    }
+
+    persistRenamedProfile();
+    await refreshGlobalLeaderboard();
+    return { ok: true, online: true };
   }
 
   function resetLeaderboard() {
@@ -765,6 +849,8 @@ export default function AirplaneQuizApp() {
         <SettingsModal
           enabledTypes={enabledTypes}
           setEnabledTypes={setEnabledTypes}
+          username={playerProfile.username}
+          onSaveUsername={updatePlayerUsername}
           onClose={() => setShowSettings(false)}
         />
       )}
@@ -781,16 +867,6 @@ export default function AirplaneQuizApp() {
         />
       )}
 
-      {askName !== null && (
-        <NamePrompt
-          defaultName={askName}
-          onCancel={() => setAskName(null)}
-          onSave={(n) => {
-            saveLeaderboard(n);
-            setAskName(null);
-          }}
-        />
-      )}
     </div>
   );
 }
@@ -852,6 +928,18 @@ function TopBar({
             </svg>
             <span className="hidden sm:inline">Leaderboard</span>
           </button>
+          <a
+            href="https://github.com/nahubn1/airplane-recognition-quiz"
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label="View project on GitHub"
+            title="View project on GitHub"
+            className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-slate-800/80 bg-slate-900/30 text-slate-400 transition hover:border-slate-700 hover:bg-slate-900/70 hover:text-slate-200 focus:outline-none focus:ring-2 focus:ring-sky-500/60"
+          >
+            <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="currentColor">
+              <path d="M12 2C6.48 2 2 6.58 2 12.23c0 4.52 2.87 8.35 6.84 9.71.5.1.68-.22.68-.49 0-.24-.01-1.05-.01-1.9-2.78.62-3.37-1.2-3.37-1.2-.45-1.18-1.11-1.49-1.11-1.49-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.9 1.57 2.35 1.12 2.92.86.09-.66.35-1.12.64-1.37-2.22-.26-4.56-1.14-4.56-5.06 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.28 2.75 1.05A9.36 9.36 0 0 1 12 6.97c.85 0 1.7.12 2.5.34 1.91-1.33 2.75-1.05 2.75-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.93-2.34 4.79-4.57 5.05.36.32.68.95.68 1.92 0 1.39-.01 2.5-.01 2.84 0 .27.18.59.69.49A10.25 10.25 0 0 0 22 12.23C22 6.58 17.52 2 12 2Z" />
+            </svg>
+          </a>
         </div>
       </div>
     </header>
@@ -1444,17 +1532,50 @@ function ResultScreen({ score, bestStreak, onPlayAgain, onBackToMenu }: any) {
   );
 }
 
-function SettingsModal({ enabledTypes, setEnabledTypes, onClose }: any) {
+function SettingsModal({
+  enabledTypes,
+  setEnabledTypes,
+  username,
+  onSaveUsername,
+  onClose,
+}: any) {
   const selectedCount = TYPES.filter((t) => enabledTypes[t]).length;
+  const [draftName, setDraftName] = useState(username);
+  const [nameStatus, setNameStatus] = useState<{
+    tone: "success" | "warning" | "error";
+    message: string;
+  } | null>(null);
+  const [savingName, setSavingName] = useState(false);
+
+  useEffect(() => setDraftName(username), [username]);
+
+  async function saveUsername() {
+    setSavingName(true);
+    setNameStatus(null);
+    const result = await onSaveUsername(draftName);
+    setSavingName(false);
+    if (!result.ok) {
+      setNameStatus({ tone: "error", message: result.error });
+      return;
+    }
+    setDraftName(normalizeUsername(draftName));
+    setNameStatus({
+      tone: result.online === false ? "warning" : "success",
+      message:
+        result.online === false
+          ? "Saved on this device. It will sync with your next score."
+          : "Username saved.",
+    });
+  }
 
   return (
-    <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/70 p-4">
-      <div className="w-full max-w-lg rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl shadow-black/40">
+    <div className="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-black/70 p-4 sm:items-center">
+      <div className="max-h-[calc(100dvh-2rem)] w-full max-w-lg overflow-y-auto rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-2xl shadow-black/40">
         <div className="mb-5 flex items-start justify-between gap-4">
           <div>
             <h3 className="text-lg font-bold">Settings</h3>
             <p className="mt-1 text-sm text-slate-400">
-              Choose which aircraft types appear in quiz rounds.
+              Manage your player profile and aircraft pool.
             </p>
           </div>
           <button
@@ -1465,6 +1586,57 @@ function SettingsModal({ enabledTypes, setEnabledTypes, onClose }: any) {
           </button>
         </div>
 
+        <div className="mb-5 rounded-xl border border-sky-800/60 bg-slate-950/70 p-4">
+          <div className="font-semibold text-white">Player username</div>
+          <p className="mt-1 text-xs leading-5 text-slate-400">
+            This name belongs to this browser and is reused automatically after every quiz.
+            Use 3–24 letters, numbers, underscores, or hyphens.
+          </p>
+          <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+            <input
+              value={draftName}
+              onChange={(event) => {
+                setDraftName(event.target.value);
+                setNameStatus(null);
+              }}
+              maxLength={24}
+              aria-label="Player username"
+              className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-sky-500"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                setDraftName(generateCallsign());
+                setNameStatus(null);
+              }}
+              className="rounded-lg border border-slate-700 px-3 py-2 text-sm font-semibold text-sky-300 hover:border-sky-500"
+            >
+              Suggest
+            </button>
+            <button
+              type="button"
+              onClick={saveUsername}
+              disabled={savingName}
+              className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-bold text-slate-950 hover:bg-sky-400 disabled:cursor-wait disabled:opacity-60"
+            >
+              {savingName ? "Saving..." : "Save"}
+            </button>
+          </div>
+          {nameStatus && (
+            <p
+              className={classNames(
+                "mt-2 text-xs",
+                nameStatus.tone === "success" && "text-emerald-400",
+                nameStatus.tone === "warning" && "text-amber-400",
+                nameStatus.tone === "error" && "text-rose-400"
+              )}
+            >
+              {nameStatus.message}
+            </p>
+          )}
+        </div>
+
+        <div className="mb-3 text-sm font-semibold text-white">Aircraft types</div>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           {TYPES.map((t) => (
             <label
@@ -1610,49 +1782,6 @@ function LeaderboardModal({ leaderboard, online, onClose, onReset }: any) {
   );
 }
 
-function NamePrompt({ defaultName, onSave, onCancel }: any) {
-  const [name, setName] = useState(defaultName || "Pilot");
-  return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4">
-      <div className="w-full max-w-sm rounded-2xl border border-slate-800 bg-slate-900 p-6">
-        <h3 className="text-lg font-semibold">New high score!</h3>
-        <p className="mt-1 text-sm text-slate-300">Use your suggested callsign or choose your own.</p>
-        <div className="mt-3 flex gap-2">
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-sky-500"
-            maxLength={24}
-          />
-          <button
-            type="button"
-            onClick={() => setName(generateCallsign())}
-            title="Suggest another callsign"
-            aria-label="Suggest another callsign"
-            className="rounded-lg border border-slate-700 px-3 text-sky-400 hover:border-sky-500"
-          >
-            ↻
-          </button>
-        </div>
-        <div className="mt-4 flex items-center justify-end gap-2">
-          <button
-            onClick={onCancel}
-            className="rounded-md border border-slate-800 px-3 py-1.5 text-sm hover:bg-slate-800"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => onSave(name)}
-            className="rounded-md bg-sky-500 px-3 py-1.5 text-sm font-semibold text-slate-950 hover:bg-sky-400"
-          >
-            Save
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function LearnModeScreen({ db, enabledTypes, setEnabledTypes, onBackToMenu }: any) {
   const [q, setQ] = useState("");
   const enabled = new Set(
@@ -1782,14 +1911,6 @@ function LearnCard({ a }: { a: Aircraft }) {
       </div>
     </div>
   );
-}
-
-// --------------------------
-// Helpers
-// --------------------------
-function isTopScore(score: number, board: Array<{ score: number }>) {
-  if (board.length < 10) return true;
-  return score > board[board.length - 1].score;
 }
 
 // --------------------------
