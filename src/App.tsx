@@ -1908,7 +1908,7 @@ function LeaderboardModal({ leaderboard, online, playerProfile, playerStanding, 
       playerRowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
     });
     return () => window.cancelAnimationFrame(frame);
-  }, []);
+  }, [leaderboard.length, playerProfile.deviceId]);
 
   return (
     <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/60 p-4">
