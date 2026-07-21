@@ -37,11 +37,87 @@ const IMAGE_WARM_QUEUE_SIZE = 5;
 const PLAYER_PROFILE_KEY = "airquiz_player_v1";
 const PLAYER_STATS_KEY = "airquiz_player_stats_v1";
 const LOCAL_LEADERBOARD_KEY = "airquiz_leaderboard_v1";
+const PRIMARY_APP_ORIGIN = "https://airplane-recognition-quiz.vercel.app";
+const LEGACY_APP_HOSTS = new Set(["airplane-recognition-quiz.pages.dev"]);
+const IDENTITY_TRANSFER_PARAM = "player-transfer";
 
 type LeaderboardEntry = { name: string; score: number; date: string; deviceId?: string };
 type AnonymousProfile = { deviceId: string; username: string; usernameChosen: boolean };
 type PlayerStats = { personalBest: number; bestStreak: number; rank?: number | null; totalPlayers?: number; topPercent?: number | null };
 type PersonalRecord = { beaten: boolean; previousBest: number; newBest: number; rank?: number | null; totalPlayers?: number; topPercent?: number | null };
+
+function encodeIdentityTransfer(value: unknown) {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+function decodeIdentityTransfer(value: string) {
+  const padded = value.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  const binary = atob(padded);
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+function isValidTransferredProfile(value: any): value is AnonymousProfile {
+  return Boolean(
+    value &&
+    typeof value.deviceId === "string" &&
+    value.deviceId.length > 0 &&
+    value.deviceId.length <= 100 &&
+    typeof value.username === "string" &&
+    /^[A-Za-z0-9_-]{3,24}$/.test(value.username) &&
+    typeof value.usernameChosen === "boolean"
+  );
+}
+
+function sanitizeTransferredStats(value: any): PlayerStats | null {
+  if (!value || !Number.isFinite(value.personalBest) || !Number.isFinite(value.bestStreak)) return null;
+  return {
+    personalBest: Math.max(0, Math.min(2900, Math.trunc(value.personalBest))),
+    bestStreak: Math.max(0, Math.min(10, Math.trunc(value.bestStreak))),
+    rank: Number.isFinite(value.rank) ? Math.max(1, Math.trunc(value.rank)) : null,
+    totalPlayers: Number.isFinite(value.totalPlayers) ? Math.max(0, Math.trunc(value.totalPlayers)) : undefined,
+    topPercent: Number.isFinite(value.topPercent) ? Math.max(1, Math.min(100, Math.trunc(value.topPercent))) : null,
+  };
+}
+
+function transferLegacyBrowserIdentity() {
+  if (typeof window === "undefined") return;
+  try {
+    if (window.location.origin === PRIMARY_APP_ORIGIN) {
+      const hash = new URLSearchParams(window.location.hash.slice(1));
+      const encoded = hash.get(IDENTITY_TRANSFER_PARAM);
+      if (!encoded) return;
+      const transfer = decodeIdentityTransfer(encoded);
+      if (isValidTransferredProfile(transfer?.profile)) {
+        localStorage.setItem(PLAYER_PROFILE_KEY, JSON.stringify(transfer.profile));
+        const stats = sanitizeTransferredStats(transfer?.stats);
+        if (stats) localStorage.setItem(PLAYER_STATS_KEY, JSON.stringify(stats));
+        if (transfer?.completed === true) localStorage.setItem(QUIZ_COMPLETED_KEY, "true");
+      }
+      hash.delete(IDENTITY_TRANSFER_PARAM);
+      const cleanHash = hash.toString();
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}${cleanHash ? `#${cleanHash}` : ""}`);
+      return;
+    }
+
+    if (LEGACY_APP_HOSTS.has(window.location.hostname)) {
+      const profile = JSON.parse(localStorage.getItem(PLAYER_PROFILE_KEY) || "null");
+      const stats = JSON.parse(localStorage.getItem(PLAYER_STATS_KEY) || "null");
+      const completed = localStorage.getItem(QUIZ_COMPLETED_KEY) === "true";
+      const transfer = isValidTransferredProfile(profile)
+        ? encodeIdentityTransfer({ profile, stats, completed })
+        : "";
+      window.location.replace(`${PRIMARY_APP_ORIGIN}/${transfer ? `#${IDENTITY_TRANSFER_PARAM}=${transfer}` : ""}`);
+    }
+  } catch {
+    // A blocked storage API should not prevent either deployment from loading.
+  }
+}
+
+transferLegacyBrowserIdentity();
 
 const CALLSIGN_BASES = [
   "Ace", "Albatross", "Arrow", "Atlas", "Aurora", "Badger", "Beacon", "Bear",
