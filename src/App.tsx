@@ -1928,7 +1928,7 @@ function LeaderboardModal({ leaderboard, online, playerProfile, playerStanding, 
           </button>
         </div>
         <div className="relative min-h-0 flex-1">
-          <div ref={listRef} className="h-full overflow-y-auto pb-14 pr-1">
+          <div ref={listRef} className="leaderboard-scroll h-full overflow-y-auto pb-14 pr-1">
             {leaderboard.length === 0 ? (
               <p className="text-sm text-slate-300">No scores yet. Play a round!</p>
             ) : (
