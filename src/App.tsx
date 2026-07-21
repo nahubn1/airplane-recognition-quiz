@@ -35,10 +35,13 @@ const IMAGE_SOURCE: "wikipedia" | "internal" = "wikipedia";
 const QUIZ_COMPLETED_KEY = "airquiz_completed_quiz_v1";
 const IMAGE_WARM_QUEUE_SIZE = 5;
 const PLAYER_PROFILE_KEY = "airquiz_player_v1";
+const PLAYER_STATS_KEY = "airquiz_player_stats_v1";
 const LOCAL_LEADERBOARD_KEY = "airquiz_leaderboard_v1";
 
 type LeaderboardEntry = { name: string; score: number; date: string; deviceId?: string };
-type AnonymousProfile = { deviceId: string; username: string };
+type AnonymousProfile = { deviceId: string; username: string; usernameChosen: boolean };
+type PlayerStats = { personalBest: number; bestStreak: number; rank?: number | null; totalPlayers?: number; topPercent?: number | null };
+type PersonalRecord = { beaten: boolean; previousBest: number; newBest: number; rank?: number | null; totalPlayers?: number; topPercent?: number | null };
 
 const CALLSIGN_BASES = [
   "Ace", "Albatross", "Arrow", "Atlas", "Aurora", "Badger", "Beacon", "Bear",
@@ -69,13 +72,14 @@ function normalizeUsername(username: string) {
 function getAnonymousProfile(): AnonymousProfile {
   try {
     const saved = JSON.parse(localStorage.getItem(PLAYER_PROFILE_KEY) || "null");
-    if (saved?.deviceId && saved?.username) return saved;
+    if (saved?.deviceId && saved?.username) return { ...saved, usernameChosen: saved.usernameChosen === true };
   } catch {
     // Create a fresh anonymous profile below.
   }
   const profile = {
     deviceId: crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`,
     username: generateCallsign(),
+    usernameChosen: false,
   };
   try {
     localStorage.setItem(PLAYER_PROFILE_KEY, JSON.stringify(profile));
@@ -85,15 +89,27 @@ function getAnonymousProfile(): AnonymousProfile {
   return profile;
 }
 
-function saveAnonymousUsername(username: string) {
+function saveAnonymousUsername(username: string, usernameChosen = true) {
   const profile = getAnonymousProfile();
-  const updated = { ...profile, username };
+  const updated = { ...profile, username, usernameChosen };
   try {
     localStorage.setItem(PLAYER_PROFILE_KEY, JSON.stringify(updated));
   } catch {
     // Continue with the in-memory submission when storage is unavailable.
   }
   return updated;
+}
+
+function readPlayerStats(): PlayerStats {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PLAYER_STATS_KEY) || "null");
+    if (saved && Number.isFinite(saved.personalBest)) return saved;
+  } catch { /* use empty stats */ }
+  return { personalBest: 0, bestStreak: 0 };
+}
+
+function writePlayerStats(stats: PlayerStats) {
+  try { localStorage.setItem(PLAYER_STATS_KEY, JSON.stringify(stats)); } catch { /* best effort */ }
 }
 
 // --------------------------
@@ -461,14 +477,30 @@ export default function AirplaneQuizApp() {
   const [playerProfile, setPlayerProfile] = useState<AnonymousProfile>(() =>
     getAnonymousProfile()
   );
+  const [playerStats, setPlayerStats] = useState<PlayerStats>(() => readPlayerStats());
+  const [playerStanding, setPlayerStanding] = useState<(LeaderboardEntry & { rank?: number | null; totalPlayers?: number; topPercent?: number | null }) | null>(null);
+  const [personalRecord, setPersonalRecord] = useState<PersonalRecord | null>(null);
+  const [showUsernameSetup, setShowUsernameSetup] = useState(() => !getAnonymousProfile().usernameChosen);
 
   async function refreshGlobalLeaderboard() {
     try {
-      const response = await fetch("/api/leaderboard", { headers: { Accept: "application/json" } });
+      const [response, playerResponse] = await Promise.all([
+        fetch("/api/leaderboard", { headers: { Accept: "application/json" } }),
+        fetch("/api/player", { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify({ deviceId: playerProfile.deviceId }) }),
+      ]);
       if (!response.ok) throw new Error("Leaderboard unavailable");
       const data = await response.json();
       if (!Array.isArray(data?.leaderboard)) throw new Error("Invalid leaderboard response");
       setLeaderboard(data.leaderboard);
+      if (playerResponse.ok) {
+        const playerData = await playerResponse.json();
+        if (playerData?.player) {
+          setPlayerStanding(playerData.player);
+          const nextStats = { personalBest: Number(playerData.player.score || 0), bestStreak: Number(playerData.player.bestStreak || 0), rank: playerData.player.rank, totalPlayers: playerData.player.totalPlayers, topPercent: playerData.player.topPercent };
+          setPlayerStats((current) => ({ ...current, ...nextStats, personalBest: Math.max(current.personalBest, nextStats.personalBest), bestStreak: Math.max(current.bestStreak, nextStats.bestStreak) }));
+          writePlayerStats(nextStats);
+        }
+      }
       setLeaderboardOnline(true);
     } catch {
       setLeaderboardOnline(false);
@@ -560,6 +592,7 @@ export default function AirplaneQuizApp() {
     setCurrent(null);
     setQuestionStatus("idle");
     setImageLoadError("");
+    setPersonalRecord(null);
   }
 
   async function startQuiz() {
@@ -629,8 +662,8 @@ export default function AirplaneQuizApp() {
       // The browser's existing anonymous profile owns every score automatically.
       setHasCompletedQuiz(true);
       localStorage.setItem(QUIZ_COMPLETED_KEY, "true");
-      void saveLeaderboard();
       setScreen("result");
+      void saveLeaderboard();
       return;
     }
     setQuestionIndex(nextIdx);
@@ -655,7 +688,7 @@ export default function AirplaneQuizApp() {
     )?.score || 0;
     const entry = {
       name: profile.username,
-      score: Math.max(score, previousBest),
+      score: Math.max(score, previousBest, playerStats.personalBest),
       date: new Date().toISOString(),
       deviceId: profile.deviceId,
     };
@@ -683,14 +716,25 @@ export default function AirplaneQuizApp() {
 
     try {
       let response = await submit();
-      // A generated name can rarely collide with another browser. Resolve that
-      // silently while keeping this browser's device identity unchanged.
-      for (let attempt = 0; response.status === 409 && attempt < 3; attempt += 1) {
-        profile = saveAnonymousUsername(generateCallsign());
-        setPlayerProfile(profile);
-        response = await submit();
+      if (response.status === 409) {
+        setShowUsernameSetup(true);
+        throw new Error("Username is already in use");
       }
       if (!response.ok) throw new Error("Score submission failed");
+      const data = await response.json();
+      const nextStats: PlayerStats = {
+        personalBest: Number(data.personalBest || score),
+        bestStreak: Number(data.bestStreak || bestStreak),
+        rank: data.rank,
+        totalPlayers: Number(data.totalPlayers || 0),
+        topPercent: data.topPercent,
+      };
+      setPlayerStats(nextStats);
+      writePlayerStats(nextStats);
+      setPlayerStanding({ name: profile.username, score: nextStats.personalBest, date: new Date().toISOString(), deviceId: profile.deviceId, rank: data.rank, totalPlayers: data.totalPlayers, topPercent: data.topPercent });
+      if (data.personalRecord) {
+        setPersonalRecord({ beaten: true, previousBest: Number(data.previousBest || 0), newBest: nextStats.personalBest, rank: data.rank, totalPlayers: data.totalPlayers, topPercent: data.topPercent });
+      }
       if (profile.username !== entry.name) {
         const corrected = updated.map((item) =>
           item.deviceId === profile.deviceId ? { ...item, name: profile.username } : item
@@ -700,6 +744,14 @@ export default function AirplaneQuizApp() {
       }
       await refreshGlobalLeaderboard();
     } catch {
+      const localBest = Math.max(playerStats.personalBest, score);
+      const localStreak = Math.max(playerStats.bestStreak, bestStreak);
+      const localStats = { ...playerStats, personalBest: localBest, bestStreak: localStreak };
+      setPlayerStats(localStats);
+      writePlayerStats(localStats);
+      if (playerStats.personalBest > 0 && score > playerStats.personalBest) {
+        setPersonalRecord({ beaten: true, previousBest: playerStats.personalBest, newBest: score });
+      }
       setLeaderboardOnline(false);
     }
   }
@@ -709,13 +761,14 @@ export default function AirplaneQuizApp() {
     if (cleanName.length < 3) {
       return { ok: false, error: "Use at least 3 letters or numbers." };
     }
-    if (cleanName === playerProfile.username) return { ok: true, online: leaderboardOnline };
+    if (cleanName === playerProfile.username && playerProfile.usernameChosen) return { ok: true, online: leaderboardOnline };
 
     const previousName = playerProfile.username;
     const candidate = { ...playerProfile, username: cleanName };
     const persistRenamedProfile = () => {
-      const saved = saveAnonymousUsername(cleanName);
+      const saved = saveAnonymousUsername(cleanName, true);
       setPlayerProfile(saved);
+      setShowUsernameSetup(false);
       setLeaderboard((current) => {
         const renamed = current.map((entry) =>
           entry.deviceId === saved.deviceId || entry.name === previousName
@@ -777,6 +830,7 @@ export default function AirplaneQuizApp() {
         }}
         score={score}
         streak={streak}
+        playerStats={playerStats}
         screen={screen}
       />
 
@@ -822,8 +876,10 @@ export default function AirplaneQuizApp() {
         <ResultScreen
           score={score}
           bestStreak={bestStreak}
+          personalRecord={personalRecord}
           onPlayAgain={startQuiz}
           onBackToMenu={() => setScreen("menu")}
+          onOpenLeaderboard={() => setShowLeaderboard(true)}
         />
       )}
 
@@ -840,6 +896,8 @@ export default function AirplaneQuizApp() {
         <LeaderboardModal
           leaderboard={leaderboard}
           online={leaderboardOnline}
+          playerProfile={playerProfile}
+          playerStanding={playerStanding}
           onClose={() => setShowLeaderboard(false)}
           onReset={resetLeaderboard}
         />
@@ -850,8 +908,17 @@ export default function AirplaneQuizApp() {
           enabledTypes={enabledTypes}
           setEnabledTypes={setEnabledTypes}
           username={playerProfile.username}
+          deviceId={playerProfile.deviceId}
           onSaveUsername={updatePlayerUsername}
           onClose={() => setShowSettings(false)}
+        />
+      )}
+
+      {showUsernameSetup && !showSettings && (
+        <UsernameSetupModal
+          deviceId={playerProfile.deviceId}
+          username={playerProfile.usernameChosen ? playerProfile.username : ""}
+          onSaveUsername={updatePlayerUsername}
         />
       )}
 
@@ -877,14 +944,19 @@ export default function AirplaneQuizApp() {
 function TopBar({
   score,
   streak,
+  playerStats,
   screen,
   onOpenLeaderboard,
 }: {
   score: number;
   streak: number;
+  playerStats: PlayerStats;
   screen: string;
   onOpenLeaderboard: () => void;
 }) {
+  const inQuiz = screen === "quiz";
+  const displayScore = inQuiz ? score : (playerStats.personalBest || "—");
+  const displayStreak = inQuiz ? streak : (playerStats.bestStreak || "—");
   return (
     <header className={classNames(
       "sticky top-0 z-20 border-b border-slate-800/80 bg-slate-950/90 backdrop-blur",
@@ -906,18 +978,18 @@ function TopBar({
         </div>
         <div className="flex items-center gap-2 text-sm sm:gap-3">
           <div className="hidden items-center gap-2 rounded-xl border border-slate-700/80 bg-slate-900/70 px-4 py-2 sm:flex">
-            <span className="font-bold text-slate-400">Score</span>
+            <span className="font-bold text-slate-400">{inQuiz ? "Score" : "Personal Best"}</span>
             <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 text-amber-300" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round">
               <path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6-5.4-2.9-5.4 2.9 1-6-4.4-4.3 6.1-.9L12 3Z" />
             </svg>
-            <span className="font-black text-white">{score}</span>
+            <span className="font-black text-white">{displayScore}</span>
           </div>
           <div className="hidden items-center gap-2 rounded-xl border border-slate-700/80 bg-slate-900/70 px-4 py-2 sm:flex">
-            <span className="font-bold text-slate-400">Streak</span>
+            <span className="font-bold text-slate-400">{inQuiz ? "Streak" : "Best Streak"}</span>
             <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5 text-orange-400" fill="currentColor">
               <path d="M13.7 2.4c.4 3.2-1.6 4.8-3.4 6.5-1.6 1.5-3.1 2.9-3.1 5.4A4.8 4.8 0 0 0 12 19.1a4.8 4.8 0 0 0 4.8-4.8c0-1.9-.9-3.4-2.1-4.8-.2 1.7-1.1 2.9-2.4 3.9.5-2.6-.1-4.7-1.9-6.3 2.2-1.1 3.3-2.7 3.3-4.7Z" />
             </svg>
-            <span className="font-black text-white">{streak}</span>
+            <span className="font-black text-white">{displayStreak}</span>
           </div>
           <button
             onClick={onOpenLeaderboard}
@@ -1505,7 +1577,7 @@ function QuizScreen({
   );
 }
 
-function ResultScreen({ score, bestStreak, onPlayAgain, onBackToMenu }: any) {
+function ResultScreen({ score, bestStreak, personalRecord, onPlayAgain, onBackToMenu, onOpenLeaderboard }: any) {
   return (
     <main className="mx-auto flex min-h-[calc(100dvh-4rem)] max-w-3xl items-center justify-center px-4 py-4">
       <div className="w-full rounded-2xl border border-slate-800 bg-slate-900/40 p-6 text-center sm:p-8">
@@ -1513,6 +1585,14 @@ function ResultScreen({ score, bestStreak, onPlayAgain, onBackToMenu }: any) {
         <p className="mt-2 text-slate-300">Final score</p>
         <div className="mt-2 text-5xl font-extrabold text-sky-400 sm:text-6xl">{score}</div>
         <div className="mt-3 text-sm text-slate-300">Best streak: {bestStreak} in a row</div>
+        {personalRecord?.beaten && (
+          <div className="record-celebration relative mt-6 overflow-hidden rounded-2xl border border-amber-300/70 bg-gradient-to-br from-amber-300/15 via-sky-500/10 to-violet-500/15 p-5 text-left shadow-[0_0_45px_rgba(56,189,248,0.2)]">
+            <div className="record-shimmer" />
+            <span className="record-particle left-[12%] top-3" /><span className="record-particle left-[72%] top-5" /><span className="record-particle left-[88%] top-16" />
+            <div className="relative"><p className="text-xs font-black uppercase tracking-[0.18em] text-amber-200">Personal record</p><p className="mt-1 text-xl font-black text-white">You just beat your best.</p><p className="mt-2 text-sm text-slate-300">{personalRecord.previousBest} <span className="text-slate-500">→</span> <span className="font-black text-sky-300">{personalRecord.newBest}</span></p>{personalRecord.rank && personalRecord.totalPlayers ? <p className="mt-2 text-sm font-semibold text-emerald-300">#{personalRecord.rank} of {personalRecord.totalPlayers} · Top {personalRecord.topPercent}% worldwide</p> : <p className="mt-2 text-xs text-slate-400">Your global placement will update when you’re online.</p>}</div>
+            <button onClick={onOpenLeaderboard} className="relative mt-4 rounded-lg border border-sky-400/40 px-3 py-2 text-xs font-bold text-sky-200 hover:bg-sky-400/10">View leaderboard</button>
+          </div>
+        )}
         <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
           <button
             onClick={onPlayAgain}
@@ -1532,41 +1612,75 @@ function ResultScreen({ score, bestStreak, onPlayAgain, onBackToMenu }: any) {
   );
 }
 
+function UsernameEditor({ deviceId, initialName, onSave, compact = false }: any) {
+  const [draftName, setDraftName] = useState(initialName || "");
+  const [availability, setAvailability] = useState<"idle" | "checking" | "available" | "taken" | "invalid" | "offline">("idle");
+  const [message, setMessage] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => setDraftName(initialName || ""), [initialName]);
+  useEffect(() => {
+    const clean = normalizeUsername(draftName);
+    if (clean.length < 3 || clean !== draftName.trim()) {
+      setAvailability(draftName ? "invalid" : "idle");
+      setMessage(draftName ? "Use 3–24 letters, numbers, _ or -." : "");
+      return;
+    }
+    setAvailability("checking");
+    const controller = new AbortController();
+    const timer = window.setTimeout(async () => {
+      try {
+        const response = await fetch("/api/username", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: clean, deviceId }), signal: controller.signal });
+        const data = await response.json();
+        setAvailability(data.available ? "available" : "taken");
+        setMessage(data.available ? "Available" : "That name is already taken.");
+      } catch {
+        if (!controller.signal.aborted) { setAvailability("offline"); setMessage("Can’t check right now; you can still save on this device."); }
+      }
+    }, 450);
+    return () => { window.clearTimeout(timer); controller.abort(); };
+  }, [draftName, deviceId]);
+
+  async function submit() {
+    const clean = normalizeUsername(draftName);
+    if (clean.length < 3 || availability === "taken" || availability === "invalid" || availability === "checking") return;
+    setSaving(true);
+    const result = await onSave(clean);
+    setSaving(false);
+    if (result.ok) setMessage(result.online === false ? "Saved on this device." : "Username saved.");
+    else { setAvailability("taken"); setMessage(result.error || "That name is unavailable."); }
+  }
+
+  return <div className={classNames("flex flex-col gap-2", compact ? "" : "sm:flex-row")}>
+    <div className="min-w-0 flex-1">
+      <input value={draftName} onChange={(e) => setDraftName(e.target.value)} maxLength={24} placeholder="Username" aria-label="Player username" className="w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none placeholder:text-slate-600 focus:border-sky-500" />
+      {message && <p className={classNames("mt-1 text-xs", availability === "available" && "text-emerald-400", availability === "taken" && "text-rose-400", availability === "offline" && "text-amber-400", availability === "invalid" && "text-rose-400", availability === "checking" && "text-slate-400")}>{availability === "checking" ? "Checking availability…" : message}</p>}
+    </div>
+    <div className="flex gap-2">
+      <button type="button" onClick={() => { setDraftName(generateCallsign()); setMessage(""); }} className="rounded-lg border border-slate-700 px-3 py-2 text-sm font-semibold text-sky-300 hover:border-sky-500">Suggest</button>
+      <button type="button" onClick={submit} disabled={saving || availability === "checking" || availability === "taken" || availability === "invalid" || !draftName} className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-bold text-slate-950 hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-50">{saving ? "Saving…" : "Save"}</button>
+    </div>
+  </div>;
+}
+
+function UsernameSetupModal({ deviceId, username, onSaveUsername }: any) {
+  return <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4">
+    <div className="w-full max-w-md rounded-2xl border border-sky-800/70 bg-slate-900 p-6 shadow-2xl shadow-black/50">
+      <div className="mb-5 flex items-start gap-3"><div className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-500/15 text-sky-300">✦</div><div><h3 className="text-lg font-bold text-white">Choose your leaderboard name</h3><p className="mt-1 text-sm leading-5 text-slate-400">No account needed. This name stays with this browser.</p></div></div>
+      <UsernameEditor deviceId={deviceId} initialName={username} onSave={onSaveUsername} />
+    </div>
+  </div>;
+}
+
 function SettingsModal({
   enabledTypes,
   setEnabledTypes,
   username,
+  deviceId,
   onSaveUsername,
   onClose,
 }: any) {
   const selectedCount = TYPES.filter((t) => enabledTypes[t]).length;
-  const [draftName, setDraftName] = useState(username);
-  const [nameStatus, setNameStatus] = useState<{
-    tone: "success" | "warning" | "error";
-    message: string;
-  } | null>(null);
-  const [savingName, setSavingName] = useState(false);
-
-  useEffect(() => setDraftName(username), [username]);
-
-  async function saveUsername() {
-    setSavingName(true);
-    setNameStatus(null);
-    const result = await onSaveUsername(draftName);
-    setSavingName(false);
-    if (!result.ok) {
-      setNameStatus({ tone: "error", message: result.error });
-      return;
-    }
-    setDraftName(normalizeUsername(draftName));
-    setNameStatus({
-      tone: result.online === false ? "warning" : "success",
-      message:
-        result.online === false
-          ? "Saved on this device. It will sync with your next score."
-          : "Username saved.",
-    });
-  }
 
   return (
     <div className="fixed inset-0 z-30 flex items-start justify-center overflow-y-auto bg-black/70 p-4 sm:items-center">
@@ -1592,48 +1706,7 @@ function SettingsModal({
             This name belongs to this browser and is reused automatically after every quiz.
             Use 3–24 letters, numbers, underscores, or hyphens.
           </p>
-          <div className="mt-3 flex flex-col gap-2 sm:flex-row">
-            <input
-              value={draftName}
-              onChange={(event) => {
-                setDraftName(event.target.value);
-                setNameStatus(null);
-              }}
-              maxLength={24}
-              aria-label="Player username"
-              className="min-w-0 flex-1 rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm outline-none focus:border-sky-500"
-            />
-            <button
-              type="button"
-              onClick={() => {
-                setDraftName(generateCallsign());
-                setNameStatus(null);
-              }}
-              className="rounded-lg border border-slate-700 px-3 py-2 text-sm font-semibold text-sky-300 hover:border-sky-500"
-            >
-              Suggest
-            </button>
-            <button
-              type="button"
-              onClick={saveUsername}
-              disabled={savingName}
-              className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-bold text-slate-950 hover:bg-sky-400 disabled:cursor-wait disabled:opacity-60"
-            >
-              {savingName ? "Saving..." : "Save"}
-            </button>
-          </div>
-          {nameStatus && (
-            <p
-              className={classNames(
-                "mt-2 text-xs",
-                nameStatus.tone === "success" && "text-emerald-400",
-                nameStatus.tone === "warning" && "text-amber-400",
-                nameStatus.tone === "error" && "text-rose-400"
-              )}
-            >
-              {nameStatus.message}
-            </p>
-          )}
+          <div className="mt-3"><UsernameEditor deviceId={deviceId} initialName={username} onSave={onSaveUsername} /></div>
         </div>
 
         <div className="mb-3 text-sm font-semibold text-white">Aircraft types</div>
@@ -1733,7 +1806,7 @@ function ConfirmQuitModal({
   );
 }
 
-function LeaderboardModal({ leaderboard, online, onClose, onReset }: any) {
+function LeaderboardModal({ leaderboard, online, playerProfile, playerStanding, onClose, onReset }: any) {
   return (
     <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/60 p-4">
       <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-6">
@@ -1755,19 +1828,25 @@ function LeaderboardModal({ leaderboard, online, onClose, onReset }: any) {
           <p className="text-sm text-slate-300">No scores yet. Play a round!</p>
         ) : (
           <ol className="space-y-2">
-            {leaderboard.map((e: any, i: number) => (
+            {leaderboard.map((e: any, i: number) => {
+              const isYou = e.deviceId === playerProfile.deviceId || e.name === playerProfile.username;
+              return (
               <li
                 key={i}
-                className="flex items-center justify-between rounded-lg border border-slate-800 bg-slate-950 px-3 py-2"
+                className={classNames("flex items-center justify-between rounded-lg border px-3 py-2", isYou ? "border-sky-400/80 bg-sky-500/10 shadow-[0_0_18px_rgba(14,165,233,0.16)]" : "border-slate-800 bg-slate-950")}
               >
                 <span className="text-sm">
                   <span className="mr-2 rounded bg-slate-800 px-2 py-0.5 text-xs">#{i + 1}</span>
-                  {e.name}
+                  {e.name} {isYou && <span className="ml-1 rounded-full bg-sky-400/20 px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-sky-200">You</span>}
                 </span>
                 <span className="text-sm font-semibold text-sky-400">{e.score}</span>
               </li>
-            ))}
+              );
+            })}
           </ol>
+        )}
+        {online && playerStanding && !leaderboard.some((e: any) => e.deviceId === playerProfile.deviceId || e.name === playerProfile.username) && (
+          <div className="mt-4 border-t border-slate-800 pt-4"><p className="mb-2 text-[11px] font-black uppercase tracking-[0.16em] text-slate-500">Your position</p><div className="flex items-center justify-between rounded-lg border border-sky-400/80 bg-sky-500/10 px-3 py-2"><span className="text-sm"><span className="mr-2 rounded bg-slate-800 px-2 py-0.5 text-xs">#{playerStanding.rank}</span>{playerStanding.name} <span className="ml-1 rounded-full bg-sky-400/20 px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-sky-200">You</span></span><span className="text-sm font-semibold text-sky-400">{playerStanding.score}</span></div></div>
         )}
         <div className="mt-4 text-right">
           <button

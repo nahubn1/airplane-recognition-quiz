@@ -43,10 +43,23 @@
   );
 }
 
+@keyframes record-shimmer {
+  from { transform: translateX(-120%) rotate(12deg); }
+  to { transform: translateX(420%) rotate(12deg); }
+}
+@keyframes record-particle {
+  0% { transform: translateY(8px) scale(.6); opacity: 0; }
+  35% { opacity: 1; }
+  100% { transform: translateY(-28px) scale(1); opacity: 0; }
+}
+.record-shimmer { position: absolute; inset: -80% auto -80% -20%; width: 18%; background: linear-gradient(90deg, transparent, rgb(255 255 255 / .24), transparent); animation: record-shimmer 2.2s ease-in-out .2s 1; }
+.record-particle { position: absolute; height: 6px; width: 6px; border-radius: 9999px; background: #fbbf24; animation: record-particle 1.8s ease-out infinite; }
+
 @media (prefers-reduced-motion: reduce) {
   .aircraft-image-skeleton {
     animation: none;
   }
+  .record-shimmer, .record-particle { animation: none; }
 }
 
 /* Windows display scaling often produces a wide but short CSS viewport at
