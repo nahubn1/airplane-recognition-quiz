@@ -750,7 +750,7 @@ export default function AirplaneQuizApp() {
       const localStats = { ...playerStats, personalBest: localBest, bestStreak: localStreak };
       setPlayerStats(localStats);
       writePlayerStats(localStats);
-      if (playerStats.personalBest > 0 && score > playerStats.personalBest) {
+      if ((playerStats.personalBest === 0 && score > 0) || score > playerStats.personalBest) {
         setPersonalRecord({ beaten: true, previousBest: playerStats.personalBest, newBest: score });
       }
       setLeaderboardOnline(false);
@@ -1590,7 +1590,7 @@ function ResultScreen({ score, bestStreak, personalRecord, onPlayAgain, onBackTo
           <div className="record-celebration relative mt-6 overflow-hidden rounded-2xl border border-amber-300/70 bg-gradient-to-br from-amber-300/15 via-sky-500/10 to-violet-500/15 p-5 text-left shadow-[0_0_45px_rgba(56,189,248,0.2)]">
             <div className="record-shimmer" />
             <span className="record-particle left-[12%] top-3" /><span className="record-particle left-[72%] top-5" /><span className="record-particle left-[88%] top-16" />
-            <div className="relative"><p className="text-xs font-black uppercase tracking-[0.18em] text-amber-200">Personal record</p><p className="mt-1 text-xl font-black text-white">You just beat your best.</p><p className="mt-2 text-sm text-slate-300">{personalRecord.previousBest} <span className="text-slate-500">→</span> <span className="font-black text-sky-300">{personalRecord.newBest}</span></p>{personalRecord.rank && personalRecord.totalPlayers ? <p className="mt-2 text-sm font-semibold text-emerald-300">#{personalRecord.rank} of {personalRecord.totalPlayers} · Top {personalRecord.topPercent}% worldwide</p> : <p className="mt-2 text-xs text-slate-400">Your global placement will update when you’re online.</p>}</div>
+            <div className="relative"><p className="text-xs font-black uppercase tracking-[0.18em] text-amber-200">Personal record</p><p className="mt-1 text-xl font-black text-white">{personalRecord.previousBest === 0 ? "Your first personal best." : "You just beat your best."}</p><p className="mt-2 text-sm text-slate-300">{personalRecord.previousBest === 0 ? <><span className="font-black text-sky-300">{personalRecord.newBest}</span> points</> : <>{personalRecord.previousBest} <span className="text-slate-500">→</span> <span className="font-black text-sky-300">{personalRecord.newBest}</span></>}</p>{personalRecord.rank && personalRecord.totalPlayers ? <p className="mt-2 text-sm font-semibold text-emerald-300">#{personalRecord.rank} of {personalRecord.totalPlayers} · Top {personalRecord.topPercent}% worldwide</p> : <p className="mt-2 text-xs text-slate-400">Your global placement will update when you’re online.</p>}</div>
             <button onClick={onOpenLeaderboard} className="relative mt-4 rounded-lg border border-sky-400/40 px-3 py-2 text-xs font-bold text-sky-200 hover:bg-sky-400/10">View leaderboard</button>
           </div>
         )}

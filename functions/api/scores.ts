@@ -74,7 +74,8 @@ export const onRequestPost: PagesFunction<Env> = async ({ request, env }) => {
 
   return Response.json({
     ok: true,
-    personalRecord: previousBest !== null && score > previousBest,
+    // A player's first meaningful score establishes their personal best.
+    personalRecord: previousBest === null ? score > 0 : score > previousBest,
     previousBest,
     personalBest: Number(finalScore?.score ?? score),
     bestStreak: Number(finalScore?.best_streak ?? bestStreak),
