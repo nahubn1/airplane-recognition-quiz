@@ -5,8 +5,13 @@ declare const process: { env: Record<string, string | undefined> };
 let schemaReady: Promise<void> | null = null;
 
 export function getSql() {
-  const connectionString = process.env.DATABASE_URL || process.env.POSTGRES_URL;
-  if (!connectionString) throw new Error("DATABASE_URL is not configured");
+  const connectionString =
+    process.env.DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.STORAGE_URL;
+  if (!connectionString) {
+    throw new Error("No Neon database connection URL is configured");
+  }
   return neon(connectionString);
 }
 
