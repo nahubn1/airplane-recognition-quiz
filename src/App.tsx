@@ -480,7 +480,7 @@ export default function AirplaneQuizApp() {
   const [playerStats, setPlayerStats] = useState<PlayerStats>(() => readPlayerStats());
   const [playerStanding, setPlayerStanding] = useState<(LeaderboardEntry & { rank?: number | null; totalPlayers?: number; topPercent?: number | null }) | null>(null);
   const [personalRecord, setPersonalRecord] = useState<PersonalRecord | null>(null);
-  const [showUsernameSetup, setShowUsernameSetup] = useState(() => !getAnonymousProfile().usernameChosen);
+  const [showUsernameSetup, setShowUsernameSetup] = useState(false);
 
   async function refreshGlobalLeaderboard() {
     try {
@@ -662,6 +662,7 @@ export default function AirplaneQuizApp() {
       // The browser's existing anonymous profile owns every score automatically.
       setHasCompletedQuiz(true);
       localStorage.setItem(QUIZ_COMPLETED_KEY, "true");
+      if (!playerProfile.usernameChosen) setShowUsernameSetup(true);
       setScreen("result");
       void saveLeaderboard();
       return;
@@ -1612,14 +1613,16 @@ function ResultScreen({ score, bestStreak, personalRecord, onPlayAgain, onBackTo
   );
 }
 
-function UsernameEditor({ deviceId, initialName, onSave, compact = false }: any) {
+function UsernameEditor({ deviceId, initialName, onSave, compact = false, alwaysEditing = false }: any) {
   const [draftName, setDraftName] = useState(initialName || "");
+  const [editing, setEditing] = useState(alwaysEditing);
   const [availability, setAvailability] = useState<"idle" | "checking" | "available" | "taken" | "invalid" | "offline">("idle");
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
 
   useEffect(() => setDraftName(initialName || ""), [initialName]);
   useEffect(() => {
+    if (!editing) return;
     const clean = normalizeUsername(draftName);
     if (clean.length < 3 || clean !== draftName.trim()) {
       setAvailability(draftName ? "invalid" : "idle");
@@ -1639,7 +1642,7 @@ function UsernameEditor({ deviceId, initialName, onSave, compact = false }: any)
       }
     }, 450);
     return () => { window.clearTimeout(timer); controller.abort(); };
-  }, [draftName, deviceId]);
+  }, [draftName, deviceId, editing]);
 
   async function submit() {
     const clean = normalizeUsername(draftName);
@@ -1647,9 +1650,19 @@ function UsernameEditor({ deviceId, initialName, onSave, compact = false }: any)
     setSaving(true);
     const result = await onSave(clean);
     setSaving(false);
-    if (result.ok) setMessage(result.online === false ? "Saved on this device." : "Username saved.");
+    if (result.ok) {
+      setMessage(result.online === false ? "Saved on this device." : "Username saved.");
+      if (!alwaysEditing) setEditing(false);
+    }
     else { setAvailability("taken"); setMessage(result.error || "That name is unavailable."); }
   }
+
+  if (!editing) return <div className="flex items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-950/70 px-3 py-2">
+    <span className="truncate text-sm font-semibold text-white">{initialName || "Username"}</span>
+    <button type="button" onClick={() => { setEditing(true); setMessage(""); }} aria-label="Edit username" title="Edit username" className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-slate-700 text-slate-300 hover:border-sky-500 hover:text-sky-300">
+      <svg aria-hidden="true" viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m4 16 9.5-9.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z" /><path d="m13.5 6.5 4 4" /></svg>
+    </button>
+  </div>;
 
   return <div className={classNames("flex flex-col gap-2", compact ? "" : "sm:flex-row")}>
     <div className="min-w-0 flex-1">
@@ -1657,8 +1670,12 @@ function UsernameEditor({ deviceId, initialName, onSave, compact = false }: any)
       {message && <p className={classNames("mt-1 text-xs", availability === "available" && "text-emerald-400", availability === "taken" && "text-rose-400", availability === "offline" && "text-amber-400", availability === "invalid" && "text-rose-400", availability === "checking" && "text-slate-400")}>{availability === "checking" ? "Checking availability…" : message}</p>}
     </div>
     <div className="flex gap-2">
-      <button type="button" onClick={() => { setDraftName(generateCallsign()); setMessage(""); }} className="rounded-lg border border-slate-700 px-3 py-2 text-sm font-semibold text-sky-300 hover:border-sky-500">Suggest</button>
-      <button type="button" onClick={submit} disabled={saving || availability === "checking" || availability === "taken" || availability === "invalid" || !draftName} className="rounded-lg bg-sky-500 px-4 py-2 text-sm font-bold text-slate-950 hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-50">{saving ? "Saving…" : "Save"}</button>
+      <button type="button" onClick={() => { setDraftName(generateCallsign()); setMessage(""); }} aria-label="Suggest a username" title="Suggest a username" className="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-slate-700 text-sky-300 hover:border-sky-500">
+        <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="m12 3 1.6 5.4L19 10l-5.4 1.6L12 17l-1.6-5.4L5 10l5.4-1.6L12 3Z" /><path d="m19 16 .7 2.3L22 19l-2.3.7L19 22l-.7-2.3L16 19l2.3-.7L19 16Z" /></svg>
+      </button>
+      <button type="button" onClick={submit} disabled={saving || availability === "checking" || availability === "taken" || availability === "invalid" || !draftName} aria-label="Save username" title="Save username" className="inline-flex h-10 w-10 items-center justify-center rounded-lg bg-sky-500 text-slate-950 hover:bg-sky-400 disabled:cursor-not-allowed disabled:opacity-50">
+        <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round"><path d="m5 12 4 4L19 6" /></svg>
+      </button>
     </div>
   </div>;
 }
@@ -1666,8 +1683,8 @@ function UsernameEditor({ deviceId, initialName, onSave, compact = false }: any)
 function UsernameSetupModal({ deviceId, username, onSaveUsername }: any) {
   return <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4">
     <div className="w-full max-w-md rounded-2xl border border-sky-800/70 bg-slate-900 p-6 shadow-2xl shadow-black/50">
-      <div className="mb-5 flex items-start gap-3"><div className="flex h-10 w-10 items-center justify-center rounded-xl bg-sky-500/15 text-sky-300">✦</div><div><h3 className="text-lg font-bold text-white">Choose your leaderboard name</h3><p className="mt-1 text-sm leading-5 text-slate-400">No account needed. This name stays with this browser.</p></div></div>
-      <UsernameEditor deviceId={deviceId} initialName={username} onSave={onSaveUsername} />
+      <div className="mb-5"><h3 className="text-lg font-bold text-white">Leaderboard name</h3><p className="mt-1 text-sm text-slate-400">Pick a name to appear on the leaderboard.</p></div>
+      <UsernameEditor deviceId={deviceId} initialName={username} onSave={onSaveUsername} alwaysEditing />
     </div>
   </div>;
 }
@@ -1837,7 +1854,7 @@ function LeaderboardModal({ leaderboard, online, playerProfile, playerStanding, 
               >
                 <span className="text-sm">
                   <span className="mr-2 rounded bg-slate-800 px-2 py-0.5 text-xs">#{i + 1}</span>
-                  {e.name} {isYou && <span className="ml-1 rounded-full bg-sky-400/20 px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-sky-200">You</span>}
+                  {e.name}
                 </span>
                 <span className="text-sm font-semibold text-sky-400">{e.score}</span>
               </li>
@@ -1846,7 +1863,7 @@ function LeaderboardModal({ leaderboard, online, playerProfile, playerStanding, 
           </ol>
         )}
         {online && playerStanding && !leaderboard.some((e: any) => e.deviceId === playerProfile.deviceId || e.name === playerProfile.username) && (
-          <div className="mt-4 border-t border-slate-800 pt-4"><p className="mb-2 text-[11px] font-black uppercase tracking-[0.16em] text-slate-500">Your position</p><div className="flex items-center justify-between rounded-lg border border-sky-400/80 bg-sky-500/10 px-3 py-2"><span className="text-sm"><span className="mr-2 rounded bg-slate-800 px-2 py-0.5 text-xs">#{playerStanding.rank}</span>{playerStanding.name} <span className="ml-1 rounded-full bg-sky-400/20 px-2 py-0.5 text-[10px] font-black uppercase tracking-wide text-sky-200">You</span></span><span className="text-sm font-semibold text-sky-400">{playerStanding.score}</span></div></div>
+          <div className="mt-4 border-t border-slate-800 pt-4"><p className="mb-2 text-[11px] font-black uppercase tracking-[0.16em] text-slate-500">Your position</p><div className="flex items-center justify-between rounded-lg border border-sky-400/80 bg-sky-500/10 px-3 py-2"><span className="text-sm"><span className="mr-2 rounded bg-slate-800 px-2 py-0.5 text-xs">#{playerStanding.rank}</span>{playerStanding.name}</span><span className="text-sm font-semibold text-sky-400">{playerStanding.score}</span></div></div>
         )}
         <div className="mt-4 text-right">
           <button
