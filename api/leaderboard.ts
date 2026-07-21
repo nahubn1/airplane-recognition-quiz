@@ -8,8 +8,7 @@ export default async function handler(request: Request) {
     SELECT p.username AS name, p.device_id AS "deviceId", s.score, s.updated_at AS date
     FROM scores s JOIN profiles p ON p.device_id = s.device_id
     WHERE s.score > 0
-    ORDER BY s.score DESC, s.updated_at ASC
-    LIMIT 10`;
+    ORDER BY s.score DESC, s.updated_at ASC`;
   return json({ leaderboard }, { headers: { "Cache-Control": "public, max-age=15" } });
 }
 

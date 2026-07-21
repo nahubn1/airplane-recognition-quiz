@@ -1900,9 +1900,19 @@ function ConfirmQuitModal({
 }
 
 function LeaderboardModal({ leaderboard, online, playerProfile, playerStanding, onClose, onReset }: any) {
+  const listRef = useRef<HTMLDivElement>(null);
+  const playerRowRef = useRef<HTMLLIElement>(null);
+
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      playerRowRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
   return (
     <div className="fixed inset-0 z-30 flex items-center justify-center bg-black/60 p-4">
-      <div className="w-full max-w-md rounded-2xl border border-slate-800 bg-slate-900 p-6">
+      <div className="flex h-[min(680px,calc(100dvh-2rem))] max-h-[calc(100dvh-2rem)] w-full max-w-md flex-col rounded-2xl border border-slate-800 bg-slate-900 p-6">
         <div className="mb-4 flex items-center justify-between">
           <div>
             <h3 className="text-lg font-semibold">Global leaderboard</h3>
@@ -1917,30 +1927,46 @@ function LeaderboardModal({ leaderboard, online, playerProfile, playerStanding, 
             Close
           </button>
         </div>
-        {leaderboard.length === 0 ? (
-          <p className="text-sm text-slate-300">No scores yet. Play a round!</p>
-        ) : (
-          <ol className="space-y-2">
-            {leaderboard.map((e: any, i: number) => {
-              const isYou = e.deviceId === playerProfile.deviceId || e.name === playerProfile.username;
-              return (
-              <li
-                key={i}
-                className={classNames("flex items-center justify-between rounded-lg border px-3 py-2", isYou ? "border-sky-400/80 bg-sky-500/10 shadow-[0_0_18px_rgba(14,165,233,0.16)]" : "border-slate-800 bg-slate-950")}
-              >
-                <span className="text-sm">
-                  <span className="mr-2 rounded bg-slate-800 px-2 py-0.5 text-xs">#{i + 1}</span>
-                  {e.name}
-                </span>
-                <span className="text-sm font-semibold text-sky-400">{e.score}</span>
-              </li>
-              );
-            })}
-          </ol>
-        )}
-        {online && playerStanding && !leaderboard.some((e: any) => e.deviceId === playerProfile.deviceId || e.name === playerProfile.username) && (
-          <div className="mt-4 border-t border-slate-800 pt-4"><p className="mb-2 text-[11px] font-black uppercase tracking-[0.16em] text-slate-500">Your position</p><div className="flex items-center justify-between rounded-lg border border-sky-400/80 bg-sky-500/10 px-3 py-2"><span className="text-sm"><span className="mr-2 rounded bg-slate-800 px-2 py-0.5 text-xs">#{playerStanding.rank}</span>{playerStanding.name}</span><span className="text-sm font-semibold text-sky-400">{playerStanding.score}</span></div></div>
-        )}
+        <div className="relative min-h-0 flex-1">
+          <div ref={listRef} className="h-full overflow-y-auto pb-14 pr-1">
+            {leaderboard.length === 0 ? (
+              <p className="text-sm text-slate-300">No scores yet. Play a round!</p>
+            ) : (
+              <ol className="space-y-2">
+                {leaderboard.map((e: any, i: number) => {
+                  const isYou = e.deviceId === playerProfile.deviceId || e.name === playerProfile.username;
+                  return (
+                  <li
+                    ref={isYou ? playerRowRef : undefined}
+                    key={e.deviceId || `${e.name}-${i}`}
+                    className={classNames("flex items-center justify-between rounded-lg border px-3 py-2", isYou ? "border-sky-400/80 bg-sky-500/10 shadow-[0_0_18px_rgba(14,165,233,0.16)]" : "border-slate-800 bg-slate-950")}
+                  >
+                    <span className="min-w-0 text-sm">
+                      <span className="mr-2 rounded bg-slate-800 px-2 py-0.5 text-xs">#{i + 1}</span>
+                      <span className="break-all">{e.name}</span>
+                    </span>
+                    <span className="ml-3 shrink-0 text-sm font-semibold text-sky-400">{e.score}</span>
+                  </li>
+                  );
+                })}
+              </ol>
+            )}
+            {online && playerStanding && !leaderboard.some((e: any) => e.deviceId === playerProfile.deviceId || e.name === playerProfile.username) && (
+              <div className="mt-4 border-t border-slate-800 pt-4"><p className="mb-2 text-[11px] font-black uppercase tracking-[0.16em] text-slate-500">Your position</p><div className="flex items-center justify-between rounded-lg border border-sky-400/80 bg-sky-500/10 px-3 py-2"><span className="text-sm"><span className="mr-2 rounded bg-slate-800 px-2 py-0.5 text-xs">#{playerStanding.rank}</span>{playerStanding.name}</span><span className="text-sm font-semibold text-sky-400">{playerStanding.score}</span></div></div>
+            )}
+          </div>
+          {leaderboard.length > 0 && (
+            <button
+              type="button"
+              onClick={() => listRef.current?.scrollTo({ top: 0, behavior: "smooth" })}
+              aria-label="Back to top"
+              title="Back to top"
+              className="absolute bottom-3 right-3 inline-flex h-10 w-10 items-center justify-center rounded-full border border-sky-500/40 bg-slate-950/95 text-sky-300 shadow-lg shadow-black/40 backdrop-blur hover:border-sky-400 hover:text-white"
+            >
+              <svg aria-hidden="true" viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2.3" strokeLinecap="round" strokeLinejoin="round"><path d="m6 15 6-6 6 6" /></svg>
+            </button>
+          )}
+        </div>
         <div className="mt-4 text-right">
           <button
             onClick={onReset}
